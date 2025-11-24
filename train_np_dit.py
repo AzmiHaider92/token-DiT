@@ -156,6 +156,20 @@ def main(args):
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
 
+    # Prepare models for training:
+    update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
+    model.train()  # important! This enables embedding dropout for classifier-free guidance
+    ema.eval()  # EMA model should always be in eval mode
+
+    if args.resume:
+        # Load a checkpoint if specified:
+        logger.info(f"Loading checkpoint from {args.resume}...")
+        checkpoint = torch.load(args.resume)
+        model.module.load_state_dict(checkpoint["model"], strict=False)
+        ema.load_state_dict(checkpoint["ema"])
+        opt.load_state_dict(checkpoint["opt"])
+        args_resumed = checkpoint["args"]
+
     # Setup data:
     transform = transforms.Compose([
         transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
@@ -183,11 +197,6 @@ def main(args):
     pixel_idx = torch.arange(args.image_size**2, device=device)  # Used to create coordinates for images
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
-    # Prepare models for training:
-    update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
-    model.train()  # important! This enables embedding dropout for classifier-free guidance
-    ema.eval()  # EMA model should always be in eval mode
-
     # Variables for monitoring/logging purposes:
     train_steps = 0
     log_steps = 0
@@ -198,21 +207,28 @@ def main(args):
     for epoch in range(args.epochs):
         logger.info(f"Beginning epoch {epoch}...")
         for img, _ in loader:
+            local_batch_size = img.shape[0]
             x1, x2 = pixel_idx//args.image_size, pixel_idx%args.image_size
             pos = torch.stack([2*x1.float()/(args.image_size-1) - 1, 
-                             2*x2.float()/(args.image_size-1) - 1], -1).to(img.device)[None].repeat(args.global_batch_size, 1, 1)
-            x = img.to(device).reshape(args.global_batch_size, args.num_channels, args.image_size*args.image_size).transpose(1, 2)
+                             2*x2.float()/(args.image_size-1) - 1], -1).to(img.device)[None].repeat(local_batch_size, 1, 1)
+            x = img.to(device).reshape(local_batch_size, args.num_channels, args.image_size*args.image_size).transpose(1, 2)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             # half image training
             # model_kwargs = dict(pos=pos, ctx_pos=pos[:, :pos.shape[1]//2], ctx_x=x[:, :pos.shape[1]//2]) 
             # set context as random set of pixels (different for each sample in batch)
-            ctx_size = torch.randint(low=3, high=args.image_size**2-3, size=[1]).item()
-            idxs = torch.cuda.FloatTensor(args.global_batch_size, args.image_size**2).uniform_().argsort(-1)[...,:ctx_size].to(img.device)
+            ctx_size = torch.randint(low=10, high=args.image_size**2//4, size=[1]).item()
+            tgt_size = args.image_size**2//3
+            idxs = torch.cuda.FloatTensor(local_batch_size, args.image_size**2).uniform_().argsort(-1).to(img.device)
+            ctx_idxs = idxs[...,:ctx_size]
+            tgt_idxs = idxs[...,ctx_size//2:tgt_size] 
             # get the relevan coordinates and values of the random idxs
-            ctx_pos = pos[torch.arange(args.global_batch_size).unsqueeze(1), idxs]
-            ctx_x = x[torch.arange(args.global_batch_size).unsqueeze(1), idxs]
-            model_kwargs = dict(pos=pos, ctx_pos=ctx_pos, ctx_x=ctx_x)
-            loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+            ctx_pos = pos[torch.arange(local_batch_size).unsqueeze(1), ctx_idxs]
+            ctx_x = x[torch.arange(local_batch_size).unsqueeze(1), ctx_idxs]
+            tgt_pos = pos[torch.arange(local_batch_size).unsqueeze(1), tgt_idxs]
+            tgt_x = x[torch.arange(local_batch_size).unsqueeze(1), tgt_idxs]
+            model_kwargs = dict(pos=tgt_pos, ctx_pos=ctx_pos, ctx_x=ctx_x)
+            loss_dict = diffusion.training_losses(model, tgt_x, t, model_kwargs)
+
             loss = loss_dict["loss"].mean()
             opt.zero_grad()
             loss.backward()
@@ -276,7 +292,8 @@ if __name__ == "__main__":
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--flow-matching", type=bool, default=False, help="Use velocity prediction.")
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-B")
-    parser.add_argument("--image-size", type=int, choices=[32, 64, 128], default=32)
+    parser.add_argument("--resume", type=str, default="", help="Path to a checkpoint to resume training from.")
+    parser.add_argument("--image-size", type=int, choices=[32, 64, 128], default=64)
     parser.add_argument("--num-channels", type=int, choices=[3, 1], default=3)
     parser.add_argument("--num-classes", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=50)
@@ -289,4 +306,5 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=10000)
     parser.add_argument("--expname", type=str, default="")
     args = parser.parse_args()
+    print(f"Arguments: {args}")
     main(args)

@@ -427,10 +427,20 @@ def DiT_S(**kwargs):
 def NPDiT_S(**kwargs):
     return NP_DiT(depth=12, hidden_size=384, num_heads=6, **kwargs)
 
+def NPDiT_B(**kwargs):
+    return NP_DiT(depth=12, hidden_size=768, num_heads=12, **kwargs)    
+def NPDiT_L(**kwargs):
+    return NP_DiT(depth=24, hidden_size=1024, num_heads=16, **kwargs)
+def NPDiT_XL(**kwargs):
+    return NP_DiT(depth=28, hidden_size=1152, num_heads=16, **kwargs)
+
 DiT_models = {
     'DiT-XL': DiT_XL,
     'DiT-L':  DiT_L,
     'DiT-B':  DiT_B,
     'DiT-S':  DiT_S,
     'NPDiT-S': NPDiT_S,
+    'NPDiT-B': NPDiT_B,
+    'NPDiT-L': NPDiT_L,
+    'NPDiT-XL': NPDiT_XL,
 }
