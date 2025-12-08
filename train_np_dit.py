@@ -8,15 +8,14 @@
 A minimal training script for DiT using PyTorch DDP.
 """
 import torch
+
+from vis import validate
+
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
 import numpy as np
@@ -28,12 +27,55 @@ from time import time
 import argparse
 import logging
 import os
-
+from torch import nn
 from latent_token_models import DiT_models
 from diffusion import create_diffusion
-from diffusers.models import AutoencoderKL
+import os
+import torch
+from datetime import timedelta
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
+import wandb
+from datetime import datetime
 
 
+def ddp_setup():
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    is_ddp = world_size > 1
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+
+    if is_ddp:
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group("nccl", timeout=timedelta(minutes=30))
+
+    return is_ddp, device, rank, world_size, local_rank
+
+
+def ddp_mean(loss: torch.Tensor) -> float | None:
+    x = loss.detach().float()               # stay on GPU, fp32
+    if dist.is_available() and dist.is_initialized():
+        dist.reduce(x, dst=0, op=dist.ReduceOp.SUM)   # sum to rank 0
+        if dist.get_rank() == 0:
+            x /= dist.get_world_size()
+            return x.item()
+        return None
+    return x.item()
+
+
+def maybe_wrap_ddp(model: nn.Module, device: torch.device, is_ddp: bool):
+    if model is None:
+        return None
+    if not is_ddp:
+        return model
+    return nn.parallel.DistributedDataParallel(
+        model,
+        device_ids=[device.index],
+        output_device=device.index,
+        find_unused_parameters=False,
+    )
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
@@ -66,11 +108,11 @@ def cleanup():
     dist.destroy_process_group()
 
 
-def create_logger(logging_dir):
+def create_logger(logging_dir, rank):
     """
     Create a logger that writes to a log file and stdout.
     """
-    if dist.get_rank() == 0:  # real logger
+    if rank == 0:  # real logger
         logging.basicConfig(
             level=logging.INFO,
             format='[\033[34m%(asctime)s\033[0m] %(message)s',
@@ -116,14 +158,13 @@ def main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
     # Setup DDP:
-    dist.init_process_group("nccl")
-    assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
-    rank = dist.get_rank()
-    device = rank % torch.cuda.device_count()
-    seed = args.global_seed * dist.get_world_size() + rank
+    is_ddp, device, rank, world, local_rank = ddp_setup()
+
+    assert args.global_batch_size % world == 0, f"Batch size must be divisible by world size."
+    seed = args.global_seed * world + rank
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
-    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    print(f"Starting rank={rank}, seed={seed}, world_size={world}.")
 
     # Setup an experiment folder:
     if rank == 0:
@@ -134,30 +175,32 @@ def main(args):
         experiment_dir = f"{args.results_dir}/{args.expname}{experiment_index_str}-{model_string_name}"  # Create an experiment folder
         checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
         os.makedirs(checkpoint_dir, exist_ok=True)
-        logger = create_logger(experiment_dir)
+        logger = create_logger(experiment_dir, rank)
         logger.info(f"Experiment directory created at {experiment_dir}")
     else:
-        logger = create_logger(None)
+        logger = create_logger(None, rank)
 
     # Create model:
     model = DiT_models[args.model](
         num_classes=args.num_classes,
         in_channels=args.num_channels,
         num_tokens=args.image_size**2,
-    )
+    ).to(device)
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
-    model = DDP(model.to(device), device_ids=[rank], find_unused_parameters=True)
+    model = maybe_wrap_ddp(model, device, is_ddp)
+
     diffusion = create_diffusion(timestep_respacing="", flow_matching=args.flow_matching)  # default: 1000 steps, linear noise schedule
     # vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    lr = 1e-4
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0)
 
     # Prepare models for training:
-    update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
+    update_ema(ema, model.module if is_ddp else model, decay=0)  # Ensure EMA is initialized with synced weights
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
 
@@ -180,14 +223,14 @@ def main(args):
     dataset = ImageFolder(args.data_path, transform=transform)
     sampler = DistributedSampler(
         dataset,
-        num_replicas=dist.get_world_size(),
+        num_replicas=world,
         rank=rank,
         shuffle=True,
         seed=args.global_seed
     )
     loader = DataLoader(
         dataset,
-        batch_size=int(args.global_batch_size // dist.get_world_size()),
+        batch_size=int(args.global_batch_size // world),
         shuffle=False,
         sampler=sampler,
         num_workers=args.num_workers,
@@ -203,6 +246,19 @@ def main(args):
     running_loss = 0
     start_time = time()
 
+    # ----- wandb -----
+    if (not is_ddp) or rank == 0:
+        # timestamped run name
+        ts = datetime.now().strftime("M%m-D%d-H%H_M%M")
+        run_name = f"Token-DiT_{ts}"
+
+        wandb.init(
+            project="Generative_sampling",
+            name=run_name,
+            id=None,
+            mode='online'
+        )
+
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(args.epochs):
         logger.info(f"Beginning epoch {epoch}...")
@@ -210,7 +266,7 @@ def main(args):
             local_batch_size = img.shape[0]
             x1, x2 = pixel_idx//args.image_size, pixel_idx%args.image_size
             pos = torch.stack([2*x1.float()/(args.image_size-1) - 1, 
-                             2*x2.float()/(args.image_size-1) - 1], -1).to(img.device)[None].repeat(local_batch_size, 1, 1)
+                             2*x2.float()/(args.image_size-1) - 1], -1).to(device)[None].repeat(local_batch_size, 1, 1)
             x = img.to(device).reshape(local_batch_size, args.num_channels, args.image_size*args.image_size).transpose(1, 2)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             # half image training
@@ -233,7 +289,7 @@ def main(args):
             opt.zero_grad()
             loss.backward()
             opt.step()
-            update_ema(ema, model.module)
+            update_ema(ema, model.module if is_ddp else model)
 
             # Log loss values:
             running_loss += loss.item()
@@ -241,44 +297,45 @@ def main(args):
             train_steps += 1
             if train_steps % args.log_every == 0:
                 # Measure training speed:
-                torch.cuda.synchronize()
-                end_time = time()
-                steps_per_sec = log_steps / (end_time - start_time)
-                # Reduce loss history over all processes:
-                avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                avg_loss = ddp_mean(loss)
+                if (not is_ddp) or rank == 0:
+                    wandb.log({
+                        "training/loss": avg_loss,
+                        "training/lr": lr,
+                    }, step=train_steps)
+                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}")
                 # Reset monitoring variables:
                 running_loss = 0
                 log_steps = 0
                 start_time = time()
 
-
             # Save DiT samples:
             if args.sample_every > 0 and train_steps % args.sample_every == 0 and train_steps > 0:
                 if rank == 0:
                     logger.info(f"Saving DiT samples at step {train_steps}...")
-                    z = torch.randn(16, args.image_size**2, args.num_channels, device=device)
-                    samples = diffusion.p_sample_loop(
-                       model.forward, z.shape, z, clip_denoised=True, model_kwargs=model_kwargs, progress=True, device=device)
-                    np.savez(f"{experiment_dir}/samples_{train_steps:07d}.npz", samples=samples.cpu().numpy())
-                
-            # Save DiT checkpoint:
-            if train_steps == args.ckpt_every//10 or train_steps == args.ckpt_every//6  or train_steps == args.ckpt_every//2 or (train_steps % args.ckpt_every == 0 and train_steps > 0):
-                if rank == 0:
-                    checkpoint = {
-                        "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
-                        "opt": opt.state_dict(),
-                        "args": args
-                    }
-                    checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
-                    torch.save(checkpoint, checkpoint_path)
-                    logger.info(f"Saved checkpoint to {checkpoint_path}")
-            dist.barrier()
+                    # complete images
+                    validate(ema,
+                             x,
+                             device,
+                             experiment_dir,
+                             train_steps,
+                             denoising_steps=4)
 
-    model.eval()  # important! This disables randomized embedding dropout
+            # Save DiT checkpoint:
+            #if train_steps == args.ckpt_every//10 or train_steps == args.ckpt_every//6  or train_steps == args.ckpt_every//2 or (train_steps % args.ckpt_every == 0 and train_steps > 0):
+            #    if rank == 0:
+            #        checkpoint = {
+            #            "model": model.module.state_dict(),
+            #            "ema": ema.state_dict(),
+            #            "opt": opt.state_dict(),
+            #            "args": args
+            #        }
+            #        checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
+            #        torch.save(checkpoint, checkpoint_path)
+            #        logger.info(f"Saved checkpoint to {checkpoint_path}")
+            #dist.barrier()
+
+    #model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
     logger.info("Done!")
