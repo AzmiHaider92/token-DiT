@@ -76,6 +76,21 @@ def maybe_wrap_ddp(model: nn.Module, device: torch.device, is_ddp: bool):
         output_device=device.index,
         find_unused_parameters=False,
     )
+
+def print_gpu_info(rank=0, world_size=1, local_rank=0):
+    if rank == 0:  # only rank 0 prints
+        print("===================================")
+        print(f"🌍 WORLD_SIZE = {world_size}")
+        print(f"🖥️  Visible GPUs = {torch.cuda.device_count()}")
+    print(f"[Rank {rank}/{world_size}] -> using cuda:{local_rank}")
+    print("===================================")
+
+def set_seed(seed: int):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
@@ -159,12 +174,8 @@ def main(args):
 
     # Setup DDP:
     is_ddp, device, rank, world, local_rank = ddp_setup()
-
-    assert args.global_batch_size % world == 0, f"Batch size must be divisible by world size."
-    seed = args.global_seed * world + rank
-    torch.manual_seed(seed)
-    torch.cuda.set_device(device)
-    print(f"Starting rank={rank}, seed={seed}, world_size={world}.")
+    print_gpu_info(rank, world, local_rank)
+    set_seed(args.global_seed)
 
     # Setup an experiment folder:
     if rank == 0:
