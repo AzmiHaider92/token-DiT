@@ -314,7 +314,7 @@ def main(args):
                         "training/loss": avg_loss,
                         "training/lr": lr,
                     }, step=train_steps)
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}")
+                    logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}")
                 # Reset monitoring variables:
                 running_loss = 0
                 log_steps = 0
