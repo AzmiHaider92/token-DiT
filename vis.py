@@ -12,50 +12,113 @@ torch.backends.cudnn.allow_tf32 = True
 
 
 
-def sample_ctx_tgt_test(img_flat: torch.Tensor, img_size: int, ctx_frac: float = 0.1):
+def sample_ctx_tgt_test(img: torch.Tensor, image_size: int, ctx_type: str):
     """
     Test-time split where context + target = all pixels, no overlap.
 
-    img_flat: (B, N, C), N = img_size**2
+    img: (B, N, C), N = image_size**2
+    Returns:
+        model_kwargs with:
+          pos    : positions of TARGET pixels only
+          ctx_pos: positions of context pixels
+          ctx_x  : values of context pixels
+        ctx_idxs: indices of context pixels (in flattened image)
     """
-    device = img_flat.device
-    B, N, C = img_flat.shape
-    assert N == img_size**2
+    device = img.device
+    B, N, C = img.shape
+    assert N == image_size ** 2
 
-    # coords for all pixels, same as before
+    # ----- 1) coords for all pixels -----
     pixel_idx = torch.arange(N, device=device)
-    x1 = pixel_idx // img_size
-    x2 = pixel_idx % img_size
-    pos = torch.stack([
-        2.0 * x1.float() / (img_size - 1) - 1.0,
-        2.0 * x2.float() / (img_size - 1) - 1.0,
-    ], dim=-1)          # (N, 2)
-    pos = pos.unsqueeze(0).expand(B, -1, -1)  # (B, N, 2)
+    x1, x2 = pixel_idx // image_size, pixel_idx % image_size
+    pos = torch.stack(
+        [
+            2 * x1.float() / (image_size - 1) - 1,  # row in [-1, 1]
+            2 * x2.float() / (image_size - 1) - 1,  # col in [-1, 1]
+        ],
+        dim=-1,
+    )[None].repeat(B, 1, 1)  # (B, N, 2)
 
-    # choose context size
-    ctx_size = int(N * ctx_frac)
+    # ----- 2) choose context indices + ctx_pos/ctx_x -----
+    #if ctx_type == "None":  # no ctx
+    #    ctx_idxs = torch.arange(0, 0, device=device).unsqueeze(0).repeat(B, 1)  # (B, 0)
+    #    ctx_pos = pos[:, :0]          # (B, 0, 2)
+    #    ctx_x = img[:, :0]            # (B, 0, C)
 
-    # random permutation per image
-    idxs = torch.rand(B, N, device=device).argsort(dim=-1)  # (B, N)
+    if ctx_type == "half":  # half image ctx
+        base = torch.arange(0, image_size ** 2 // 2, device=device)  # (Nc,)
+        ctx_idxs = base.unsqueeze(0).repeat(B, 1)                     # (B, Nc)
+        ctx_pos = pos[:, base]                                        # (B, Nc, 2)
+        ctx_x = img[:, base]                                          # (B, Nc, C)
 
-    ctx_idxs = idxs[..., :ctx_size]      # (B, ctx_size)
+    elif ctx_type == "frame":  # outer frame, width=image_size/8
+        ctx_upper = torch.arange(0, image_size ** 2 // 8, device=device)
+        ctx_lower = torch.arange(7 * image_size ** 2 // 8, image_size ** 2, device=device)
 
-    # target = complement of context
-    all_idxs = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)  # (B, N)
-    mask = torch.ones_like(all_idxs, dtype=torch.bool)
-    mask.scatter_(1, ctx_idxs, False)
-    tgt_idxs = all_idxs[mask].view(B, N - ctx_size)  # (B, N - ctx_size)
+        ctx_left = [
+            torch.arange(
+                i + image_size ** 2 // 8,
+                7 * image_size ** 2 // 8,
+                image_size,
+                device=device,
+            )
+            for i in range(image_size // 8)
+        ]
+        ctx_right = [
+            torch.arange(
+                image_size ** 2 // 8 + image_size - 1 - i,
+                7 * image_size ** 2 // 8,
+                image_size,
+                device=device,
+            )
+            for i in range(image_size // 8)
+        ]
 
-    batch_idx = torch.arange(B, device=device).unsqueeze(-1)
+        base = torch.concat([ctx_upper, ctx_lower] + ctx_left + ctx_right)  # (Nc,)
+        ctx_idxs = base.unsqueeze(0).repeat(B, 1)                            # (B, Nc)
+        ctx_pos = pos[:, base]                                              # (B, Nc, 2)
+        ctx_x = img[:, base]                                                # (B, Nc, C)
 
-    ctx_pos = pos[batch_idx, ctx_idxs]         # (B, ctx_size, 2)
-    ctx_x = img_flat[batch_idx, ctx_idxs]    # (B, ctx_size, C)
+    elif ctx_type == "quart":  # quarter image ctx (top + bottom quarters)
+        ctx_idxs1 = torch.arange(0, image_size ** 2 // 4, device=device)
+        ctx_idxs2 = torch.arange(3 * image_size ** 2 // 4, image_size ** 2, device=device)
+        base = torch.concat([ctx_idxs1, ctx_idxs2])                         # (Nc,)
+        ctx_idxs = base.unsqueeze(0).repeat(B, 1)                           # (B, Nc)
+        ctx_pos = pos[:, base]                                             # (B, Nc, 2)
+        ctx_x = img[:, base]                                               # (B, Nc, C)
 
-    tgt_pos = pos[batch_idx, tgt_idxs]         # (B, N - ctx_size, 2)
-    tgt_x = img_flat[batch_idx, tgt_idxs]    # if you want GT for eval
-    model_kwargs = dict(pos=tgt_pos, ctx_pos=ctx_pos, ctx_x=ctx_x)
+    else:
+        # random ~5% of pixels as context, per image
+        ctx_size = image_size ** 2 // 20
+        # random permutation of indices per batch element
+        rand = torch.rand(B, N, device=device)
+        ctx_idxs = rand.argsort(dim=-1)[..., :ctx_size]                    # (B, ctx_size)
+        batch_idx = torch.arange(B, device=device).unsqueeze(1)            # (B, 1)
+        ctx_pos = pos[batch_idx, ctx_idxs]                                 # (B, ctx_size, 2)
+        ctx_x = img[batch_idx, ctx_idxs]                                   # (B, ctx_size, C)
 
-    return model_kwargs, tgt_x
+    # ----- 3) compute target indices = complement of ctx_idxs -----
+    # mask[i, j] = True iff pixel j is TARGET for batch i
+    mask = torch.ones(B, N, dtype=torch.bool, device=device)
+    if ctx_idxs.numel() > 0:
+        mask.scatter_(1, ctx_idxs, False)
+
+    # nonzero returns (batch_idx, col_idx); we want col_idx reshaped per batch
+    _, tgt_flat = mask.nonzero(as_tuple=True)          # (B * Ntgt,)
+    tgt_idxs = tgt_flat.view(B, -1)                    # (B, Ntgt)
+
+    # positions for target pixels only
+    batch_idx = torch.arange(B, device=device).unsqueeze(1)  # (B, 1)
+    pos_tgt = pos[batch_idx, tgt_idxs]                       # (B, Ntgt, 2)
+
+    # ----- 4) build model kwargs with TARGET positions only -----
+    model_kwargs = dict(
+        pos=pos_tgt,   # <--- changed: only target positions
+        ctx_pos=ctx_pos,
+        ctx_x=ctx_x,
+    )
+
+    return model_kwargs, tgt_idxs.shape[1]
 
 
 def _coords_to_indices(coords: torch.Tensor, img_size: int):
@@ -144,41 +207,40 @@ def validate(
     device,
     savedir,
     step,
-    denoising_steps=1000
+    T=1000,
+    ctx_type="half"
 ):
+
+    model.eval()
     # Pull one batch for shape; JAX also takes shapes from current dataset. :contentReference[oaicite:10]{index=10}
     img_size = 64
-    B = img.shape[0]
+    B, img_flat_size, C = img.shape
 
     # batch
-    model_kwargs, tgt_x = sample_ctx_tgt_test(
-        img_flat=img,
-        img_size=img_size,
-    )
+    model_kwargs, Ntgt = sample_ctx_tgt_test(img, img_size, ctx_type=ctx_type)
 
-    x_t = torch.randn(tgt_x.shape, dtype=tgt_x.dtype, device=device)
+    x = torch.randn(B, Ntgt, C, device=device)
 
-    dt = 1 / denoising_steps
     # loop to denoise
-    with torch.no_grad():
-        for ti in range(denoising_steps):
-            t = ti / denoising_steps
-            t = torch.full((B,), t, device=device, dtype=torch.float32)
-            v = model(x_t, t, **model_kwargs)
-            x_t = x_t + v * dt
+    for t in range(T):
+        with torch.no_grad():
+            pred = model(x, torch.Tensor([T - t] * x.shape[0]).to(device), **model_kwargs)
+        alpha = 1 + t / T * (1 - t / T)
+        sigma = 0.2 * (t / T * (1 - t / T)) ** 0.5
+        x += (alpha * pred + sigma * torch.randn_like(x).to(x.device)) / T
+        x = x.clamp_(-1., 1.)
 
-        x1_pred = x_t.detach().clone()
+    x = x.detach()
 
     imgs = build_ctx_tgt_viz_images(
         img_flat=img,  # (B, N, C) in [-1,1]
         ctx_x=model_kwargs['ctx_pos'],
         ctx_y=model_kwargs['ctx_x'],
         tgt_x=model_kwargs['pos'],
-        pred_y=x1_pred,
-        img_size=64,
+        pred_y=x,
+        img_size=img_size,
         n_examples=8,  # number of columns
         )
-
 
     grid = vutils.make_grid(
         imgs,

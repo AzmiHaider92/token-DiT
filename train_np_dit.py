@@ -330,20 +330,21 @@ def main(args):
                              device,
                              experiment_dir,
                              train_steps,
-                             denoising_steps=4)
+                             args.sample_T,
+                             args.sample_ctx_type)
 
             # Save DiT checkpoint:
-            #if train_steps == args.ckpt_every//10 or train_steps == args.ckpt_every//6  or train_steps == args.ckpt_every//2 or (train_steps % args.ckpt_every == 0 and train_steps > 0):
-            #    if rank == 0:
-            #        checkpoint = {
-            #            "model": model.module.state_dict(),
-            #            "ema": ema.state_dict(),
-            #            "opt": opt.state_dict(),
-            #            "args": args
-            #        }
-            #        checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
-            #        torch.save(checkpoint, checkpoint_path)
-            #        logger.info(f"Saved checkpoint to {checkpoint_path}")
+            if (train_steps % args.ckpt_every == 0 and train_steps > 0):
+                if rank == 0:
+                    checkpoint = {
+                        "model": model.module.state_dict() if is_ddp else model.state_dict(),
+                        "ema": ema.state_dict(),
+                        "opt": opt.state_dict(),
+                        "args": args
+                    }
+                    checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
+                    torch.save(checkpoint, checkpoint_path)
+                    logger.info(f"Saved checkpoint to {checkpoint_path}")
             #dist.barrier()
 
     #model.eval()  # important! This disables randomized embedding dropout
@@ -371,6 +372,9 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--sample-every", type=int, default=-1)
+    parser.add_argument("--sample-T", type=int, default=1000)
+    parser.add_argument("--sample-ctx-type", type=str, choices=["half", "frame", "quart", "random5"], default="half")
+
     parser.add_argument("--ckpt-every", type=int, default=10000)
     parser.add_argument("--expname", type=str, default="")
     args = parser.parse_args()

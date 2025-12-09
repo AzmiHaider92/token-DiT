@@ -313,15 +313,15 @@ class NP_DiT(nn.Module):
     def forward(self, x, t, pos, ctx_pos, ctx_x):
         """
         Forward pass of DiT.
-        x: (N, T1, C) tensor of tokenized target coordinates
-        y: (N, T1, C) tensor of tokenized target values (usually noisy)
-        ctx_x: (N, T2, C) tensor of tokenized context coordinates
-        ctx_y: (N, T2, C) tensor of tokenized context values 
+        pos: (N, T1, C) tensor of tokenized target coordinates
+        x: (N, T1, C) tensor of tokenized target values (usually noisy - xt = (1-t)x_clean + t*noise)
+        ctx_pos: (N, T2, C) tensor of tokenized context coordinates
+        ctx_x: (N, T2, C) tensor of tokenized context values
         t: (N,) tensor of diffusion timesteps
         """
         posenc_tgt = get_pos_enc(self.posenc_size, pos)
         posenc_ctx = get_pos_enc(self.posenc_size, ctx_pos)
-        h = torch.cat((torch.cat([posenc_tgt, x], dim=2), 
+        h = torch.cat((torch.cat([posenc_tgt, x], dim=2),
                        torch.cat([posenc_ctx, ctx_x], dim=2)), dim=1)
         h = self.h_embedder(h)  # (N, T, D)
         t = self.t_embedder(t)    # (N, D)
