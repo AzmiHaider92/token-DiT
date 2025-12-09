@@ -244,7 +244,7 @@ def validate(
 
     grid = vutils.make_grid(
         imgs,
-        nrow=8,  # == n_examples → 3 rows
+        nrow=B,  # == n_examples → 3 rows
         padding=2,
         normalize=True,
         value_range=(-1, 1)
