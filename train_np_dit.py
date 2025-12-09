@@ -349,7 +349,15 @@ def main(args):
 
     #model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
-
+    if rank == 0:
+        checkpoint = {
+            "model": model.module.state_dict() if is_ddp else model.state_dict(),
+            "ema": ema.state_dict(),
+            "opt": opt.state_dict(),
+            "args": args
+        }
+        checkpoint_path = f"{checkpoint_dir}/final.pt"
+        torch.save(checkpoint, checkpoint_path)
     logger.info("Done!")
     cleanup()
 
