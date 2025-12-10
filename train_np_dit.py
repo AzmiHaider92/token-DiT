@@ -335,13 +335,13 @@ def main(args):
     run = None
     if (not is_ddp and rank == 0) or (is_ddp and rank == 0):
         ts = datetime.now().strftime("M%m-D%d-H%H_M%M")
-        run_name = f"Token-DiT_{ts}"
+        run_name = f"Token-DiT_{args.expname}_{ts}"
 
         run = wandb.init(
             project="Generative_sampling",
             name=run_name,
             id=None,
-            mode="offline",
+            mode="online",
         )
 
     # Create model:
