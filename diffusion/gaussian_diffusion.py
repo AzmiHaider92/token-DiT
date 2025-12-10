@@ -730,54 +730,59 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
-    def shortcut(self, model, x0, xt, t, noise, model_kwargs):
-        # xt = x_start * (1.0 - tt) + noise * tt
+    def _sub_kwargs(self, args_dict, B_bs):
+        sub_dict = {}
+        for k, v in args_dict.items():
+            # If it's a tensor with batch dimension B, take first B_bs
+            if torch.is_tensor(v) and v.dim() >= 1 and v.size(0) >= B_bs:
+                sub_dict[k] = v[:B_bs]
+            else:
+                # Non-tensors or things without batch dim stay unchanged
+                sub_dict[k] = v
+        return sub_dict
+
+    def shortcut_targets(self, model, x0, xt, t, noise, model_kwargs, sc_frac):
+        # xt = x0 * (1.0 - tt) + noise * tt
 
         T = self.num_timesteps
         B = x0.shape[0]
         device = x0.device
+        dt = model_kwargs["dt"]
+        B_bs = int(B * sc_frac)
+
+        # base flow-matching target
         v = x0 - noise
 
-        tt = t.unsqueeze(-1).unsqueeze(-1) / T
+        half_dt = (0.5 * dt).int()
+        # backward in time: t2 = t - dt
+        t2 = (t - half_dt)
+        assert (t2-half_dt >= 0).all()
 
-        # Maximum allowed dt per element so that t + dt ≤ T-1
-        max_dt = (T - 1) - t  # shape (B,)
-
-        # If t == T-1, max_dt == 0, which would give no legal dt
-        # you can either:
-        # - resample those t, or
-        # - force dt=0 (no shortcut) and mask them out
-
-        # Let's ignore t == T-1 by clamping t high to T-1-1 first
-        valid_mask = max_dt > 0
-        if not valid_mask.all():
-            # Quick fix: force those t to be in [0, T-2]
-            t[~valid_mask] = T - 2
-            max_dt = (T - 1) - t
-
-        # Now max_dt ≥ 1 everywhere
-        u = torch.rand(B, device=device)
-        dt = 1 + (u * max_dt.float()).floor().long()  # dt ∈ {1,…, max_dt}
-
-        t2 = t + dt
-        assert (t2 < T).all()
-
-        #
-        B_bs = 0.5 * B
+        # use 0.25 of the batch for shortcut bootstrap
         xt_bs = xt[:B_bs]
         t_bs = t[:B_bs]
         t2_bs = t2[:B_bs]
-        dt_bs = dt[:B_bs]
-        with torch.no_grad():
-            v1 = model(xt_bs, t_bs, dt_bs, **model_kwargs)
-            xt2 = xt_bs + v1 * dt_bs
-            v2 = model(xt2, t2_bs, dt_bs, **model_kwargs)
-            v_target = 0.5 * (v1+v2)
+        half_dt = half_dt[:B_bs]  # positive step-size (magnitude)
+        model_kwargs_Bs = self._sub_kwargs(model_kwargs, B_bs)
 
+        # broadcast dt as scalar step-size for xt update
+        half_dt_broadcast = half_dt.view(-1, *([1] * (xt_bs.ndim - 1))).float()
+
+        with torch.no_grad():
+            # teacher velocities along a backward jump of size dt
+            v1 = model(xt_bs, t_bs, **model_kwargs_Bs)
+            # backward step in x: x(t2) ≈ x(t) + dt * v
+            step = half_dt_broadcast / T
+            xt2 = xt_bs + step * v1
+
+            v2 = model(xt2, t2_bs, **model_kwargs_Bs)
+            v_target = 0.5 * (v1 + v2)
+
+        # replace targets for first half of batch by shortcut teacher
         v[:B_bs] = v_target
         return v
 
-    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
+    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None, sc_frac=0.25):
         """
         Compute training losses for a single timestep.
         :param model: the model to evaluate loss on.
@@ -795,8 +800,21 @@ class GaussianDiffusion:
             noise = th.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise=noise)
 
-        terms = {}
+        # generate targets
+        if self.model_mean_type == ModelMeanType.SHORTCUT:
+            target = self.shortcut_targets(model, x_start, x_t, t, noise, model_kwargs, sc_frac)
+        else:
+            target = {
+                ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
+                    x_start=x_start, x_t=x_t, t=t
+                )[0],
+                ModelMeanType.START_X: x_start,
+                ModelMeanType.EPSILON: noise,
+                ModelMeanType.VELOCITY: (x_start - noise),
+            }[self.model_mean_type]
 
+        # generate model output and calculate loss
+        terms = {}
         if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
             terms["loss"] = self._vb_terms_bpd(
                 model=model,
@@ -810,7 +828,6 @@ class GaussianDiffusion:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
             model_output = model(x_t, t, **model_kwargs)
-
             if self.model_var_type in [
                 ModelVarType.LEARNED,
                 ModelVarType.LEARNED_RANGE,
@@ -832,17 +849,7 @@ class GaussianDiffusion:
                     # Divide by 1000 for equivalence with initial implementation.
                     # Without a factor of 1/1000, the VB term hurts the MSE term.
                     terms["vb"] *= self.num_timesteps / 1000.0
-            target = {
-                ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
-                    x_start=x_start, x_t=x_t, t=t
-                )[0],
-                ModelMeanType.START_X: x_start,
-                ModelMeanType.EPSILON: noise,
-                ModelMeanType.VELOCITY: (x_start - noise),
-                # <--------------------------------------------------------------------------------------- shortcut here
-                # TODO: use ema here??
-                #ModelMeanType.SHORTCUT: self.shortcut(model, x_start, x_t, t, noise, model_kwargs)
-            }[self.model_mean_type]
+
             assert model_output.shape == target.shape == x_start.shape
             terms["mse"] = mean_flat((target - model_output) ** 2)
             #print(ModelMeanType, tt)

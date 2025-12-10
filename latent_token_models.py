@@ -277,6 +277,7 @@ class NP_DiT(nn.Module):
         print('init2', self.posenc_size, hidden_size)
         self.h_embedder = nn.Linear(in_channels+2*posenc_size, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
+        self.dt_embedder = TimestepEmbedder(hidden_size)
         #self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         
         self.blocks = nn.ModuleList([
@@ -298,6 +299,10 @@ class NP_DiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
+        # Initialize dt embedding MLP:
+        nn.init.normal_(self.dt_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.dt_embedder.mlp[2].weight, std=0.02)
+
         # Zero-out adaLN modulation layers in DiT blocks:
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
@@ -309,8 +314,7 @@ class NP_DiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    
-    def forward(self, x, t, pos, ctx_pos, ctx_x):
+    def forward(self, x, t, pos, ctx_pos, ctx_x, dt=None):
         """
         Forward pass of DiT.
         pos: (N, T1, C) tensor of tokenized target coordinates
@@ -319,15 +323,19 @@ class NP_DiT(nn.Module):
         ctx_x: (N, T2, C) tensor of tokenized context values
         t: (N,) tensor of diffusion timesteps
         """
+        if dt is None:
+            dt = torch.zeros_like(t)
         posenc_tgt = get_pos_enc(self.posenc_size, pos)
         posenc_ctx = get_pos_enc(self.posenc_size, ctx_pos)
         h = torch.cat((torch.cat([posenc_tgt, x], dim=2),
                        torch.cat([posenc_ctx, ctx_x], dim=2)), dim=1)
         h = self.h_embedder(h)  # (N, T, D)
         t = self.t_embedder(t)    # (N, D)
+        dt = self.dt_embedder(dt)
+        c = t + dt
         for block in self.blocks:
-            h = block(h, t)              
-        y = self.final_layer(h, t)[:, :x.shape[1]]
+            h = block(h, c)
+        y = self.final_layer(h, c)[:, :x.shape[1]]
         return y
 
 

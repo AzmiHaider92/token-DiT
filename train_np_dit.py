@@ -7,6 +7,8 @@
 """
 A minimal training script for DiT using PyTorch DDP.
 """
+import math
+
 import torch
 
 from vis import validate
@@ -171,6 +173,127 @@ def center_crop_arr(pil_image, image_size):
     return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
 
+def sample_timesteps(
+    T: int,
+    shape,
+    device,
+    use_shortcut: bool,
+    shortcut_frac: float = 0.25,
+    shortcut_mode: str = "integer",   # "integer" | "dyadic" | "dyadic_full"
+):
+    """
+    Sample (t, dt) for FM + shortcut training, with integer time.
+
+    Conventions:
+        - Forward diffusion time indices: 0 ... T-1
+        - Shortcut is a backward jump: t2 = t - dt
+        - dt > 0  => shortcut example, with jump length dt (integer steps)
+        - dt == 0 => pure FM example (no shortcut)
+
+    Args:
+        T: total number of timesteps (integer).
+        shape: e.g. x.shape; only shape[0] (batch size) is used.
+        device: a torch.device.
+        use_shortcut: enable shortcut sampling if True.
+        shortcut_frac: fraction of batch that will use shortcuts (0..1).
+                       First B_sc examples will be shortcut; rest FM.
+        shortcut_mode:
+            - "integer":
+                dt ∈ {1, ..., T-1}
+                t ∈ {dt, ..., T-1}
+            - "dyadic":
+                dt ∈ {1, 2, 4, ..., 2^k ≤ T-1}
+                t is multiple of dt: t ∈ {dt, 2dt, ..., ≤ T-1}
+            - "dyadic_full":
+                same as "dyadic" but also includes full-path jump dt = T-1.
+
+    Returns:
+        t:  LongTensor of shape (B,)  in [0, T-1]
+        dt: LongTensor of shape (B,)  with dt >= 0
+            dt == 0 for FM-only examples
+            dt > 0 for shortcut examples
+    """
+    B = shape[0]
+
+    # --- default: FM everywhere ---
+    # FM timesteps: uniform over [0, T-1]
+    t = torch.randint(0, T, (B,), device=device)
+    # dt = 0 means "no shortcut" / pure FM
+    dt = torch.zeros(B, dtype=torch.long, device=device)
+
+    if (not use_shortcut) or (T <= 1) or (B == 0):
+        return t, dt
+
+    # how many examples will use shortcut
+    shortcut_frac_clamped = max(0.0, min(1.0, float(shortcut_frac)))
+    B_sc = int(B * shortcut_frac_clamped)
+    if B_sc == 0:
+        return t, dt
+
+    # ---------- 1) Build dt_choices for shortcut part ----------
+    if shortcut_mode == "integer":
+        # dt ∈ {1, ..., T-1}
+        dt_choices = torch.arange(1, T, device=device, dtype=torch.long)
+
+    elif shortcut_mode in ("dyadic", "dyadic_full"):
+        # dyadic dt: {1, 2, 4, ..., 2^k <= T-1}
+        max_pow = int(math.log2(T - 1))  # T>1 here
+        powers = torch.tensor(
+            [2 ** k for k in range(max_pow + 1)],
+            device=device,
+            dtype=torch.long
+        )
+        powers = powers[powers <= (T - 1)]
+
+        if shortcut_mode == "dyadic_full":
+            # explicitly include full-path jump dt = T-1 as well
+            full_jump = torch.tensor([T - 1], device=device, dtype=torch.long)
+            dt_choices = torch.unique(torch.cat([powers, full_jump]))
+        else:
+            dt_choices = powers
+
+    else:
+        raise ValueError(f"Unknown shortcut_mode: {shortcut_mode}")
+
+    # safety: ensure dt_choices not empty
+    if dt_choices.numel() == 0:
+        # fallback to FM-only if something degenerate happens
+        return t, dt
+
+    # ---------- 2) Sample dt for the shortcut part (first B_sc) ----------
+    choice_idx = torch.randint(
+        low=0,
+        high=dt_choices.numel(),
+        size=(B_sc,),
+        device=device
+    )
+    dt_sc = dt_choices[choice_idx]  # shape (B_sc,)
+
+    # ---------- 3) Sample t for the shortcut part given dt_sc ----------
+    if shortcut_mode == "integer":
+        # t_sc ∈ {dt_sc, ..., T-1}, contiguous
+        max_offset = T - dt_sc           # >= 1 because dt_sc <= T-1
+        u = torch.rand(B_sc, device=device)
+        offset = (u * max_offset.float()).floor().long()  # 0 ... max_offset-1
+        t_sc = dt_sc + offset
+
+    else:  # "dyadic" or "dyadic_full"
+        # t_sc must be a multiple of dt_sc: t_sc = m * dt_sc,
+        # with m ∈ {1, ..., floor((T-1)/dt_sc)} to keep t_sc <= T-1
+        max_m = (T - 1) // dt_sc         # shape (B_sc,), each >= 1
+        u = torch.rand(B_sc, device=device)
+        m = 1 + (u * max_m.float()).floor().long()  # 1..max_m[i]
+        t_sc = m * dt_sc                 # shape (B_sc,), guaranteed in [dt_sc, T-1]
+
+    # ---------- 4) Mix shortcut and FM ----------
+    t[:B_sc] = t_sc
+    dt[:B_sc] = dt_sc
+    # t[B_sc:] remain FM: uniform [0, T-1]
+    # dt[B_sc:] remain 0
+
+    return t, dt
+
+
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
@@ -218,7 +341,7 @@ def main(args):
             project="Generative_sampling",
             name=run_name,
             id=None,
-            mode="online",
+            mode="offline",
         )
 
     # Create model:
@@ -232,7 +355,8 @@ def main(args):
     requires_grad(ema, False)
     model = maybe_wrap_ddp(model, device, is_ddp)
 
-    diffusion = create_diffusion(timestep_respacing="", flow_matching=args.flow_matching, use_shortcut=args.use_shortcut)  # default: 1000 steps, linear noise schedule
+    diffusion = create_diffusion(timestep_respacing="", diffusion_steps=args.train_T, # default: 1000 steps, linear noise schedule
+                                 flow_matching=args.flow_matching, use_shortcut=args.use_shortcut)
     # vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -296,8 +420,8 @@ def main(args):
             pos = torch.stack([2*x1.float()/(args.image_size-1) - 1, 
                              2*x2.float()/(args.image_size-1) - 1], -1).to(device)[None].repeat(local_batch_size, 1, 1)
             x = img.to(device).reshape(local_batch_size, args.num_channels, args.image_size*args.image_size).transpose(1, 2)
-            t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
-            dt = 1 - t
+            t, dt = sample_timesteps(args.train_T, x.shape, device, args.use_shortcut,
+                                     shortcut_mode=args.shortcut_mode, shortcut_frac=args.shortcut_frac)
             # half image training
             # model_kwargs = dict(pos=pos, ctx_pos=pos[:, :pos.shape[1]//2], ctx_x=x[:, :pos.shape[1]//2]) 
             # set context as random set of pixels (different for each sample in batch)
@@ -311,8 +435,8 @@ def main(args):
             ctx_x = x[torch.arange(local_batch_size).unsqueeze(1), ctx_idxs]
             tgt_pos = pos[torch.arange(local_batch_size).unsqueeze(1), tgt_idxs]
             tgt_x = x[torch.arange(local_batch_size).unsqueeze(1), tgt_idxs]
-            model_kwargs = dict(pos=tgt_pos, ctx_pos=ctx_pos, ctx_x=ctx_x) #, dt=dt, sc_frac=0.25)
-            loss_dict = diffusion.training_losses(model, tgt_x, t, model_kwargs)
+            model_kwargs = dict(pos=tgt_pos, ctx_pos=ctx_pos, ctx_x=ctx_x, dt=dt)
+            loss_dict = diffusion.training_losses(model, tgt_x, t, model_kwargs, sc_frac=args.shortcut_frac)
 
             loss = loss_dict["loss"].mean()
             opt.zero_grad()
@@ -386,7 +510,11 @@ if __name__ == "__main__":
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--flow-matching", type=bool, default=False, help="Use velocity prediction.")
+    parser.add_argument("--train-T", type=int, default=1024)
     parser.add_argument("--use-shortcut", type=bool, default=False, help="In flow matching, use shortcuts.")
+    parser.add_argument("--shortcut-mode", type=str, choices=["integer", "dyadic", "dyadic_full"], default="integer")
+    parser.add_argument("--shortcut-frac", type=float, default=0.25)
+
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-B")
     parser.add_argument("--resume", type=str, default="", help="Path to a checkpoint to resume training from.")
     parser.add_argument("--image-size", type=int, choices=[32, 64, 128], default=64)
