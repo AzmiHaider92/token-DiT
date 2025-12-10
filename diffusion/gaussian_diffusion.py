@@ -774,10 +774,11 @@ class GaussianDiffusion:
             # backward step in x: x(t2) ≈ x(t) + dt * v
             step = half_dt_broadcast / T
             xt2 = xt_bs + step * v1
+            xt2 = torch.clamp(xt2, -4.0, 4.0)
 
             v2 = model(xt2, t2_bs, **model_kwargs_Bs)
             v_target = 0.5 * (v1 + v2)
-
+        v_target = torch.clamp(v_target, -4.0, 4.0)
         # replace targets for first half of batch by shortcut teacher
         v[:B_bs] = v_target
         return v

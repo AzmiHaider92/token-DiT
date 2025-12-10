@@ -361,7 +361,7 @@ def main(args):
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    lr = 1e-4
+    lr = args.lr
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0)
 
     # Prepare models for training:
@@ -441,6 +441,7 @@ def main(args):
             loss = loss_dict["loss"].mean()
             opt.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             update_ema(ema, model.module if is_ddp else model)
 
@@ -521,6 +522,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-channels", type=int, choices=[3, 1], default=3)
     parser.add_argument("--num-classes", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)
     # parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
