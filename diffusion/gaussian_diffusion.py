@@ -7,6 +7,7 @@
 import math
 
 import numpy as np
+import torch
 import torch as th
 import enum
 
@@ -29,6 +30,7 @@ class ModelMeanType(enum.Enum):
     START_X = enum.auto()  # the model predicts x_0
     EPSILON = enum.auto()  # the model predicts epsilon
     VELOCITY = enum.auto()  # the model predicts the flow velocity
+    SHORTCUT = enum.auto() # added: a mix between flow velocity and shortcuts
 
 
 
@@ -227,7 +229,7 @@ class GaussianDiffusion:
         if noise is None:
             noise = th.randn_like(x_start)
         assert noise.shape == x_start.shape
-        if self.model_mean_type == ModelMeanType.VELOCITY:
+        if self.model_mean_type == ModelMeanType.VELOCITY or self.model_mean_type == ModelMeanType.SHORTCUT:
             tt = t.unsqueeze(-1).unsqueeze(-1) / self.num_timesteps
             return x_start * (1.0 - tt) + noise * tt
         else:
@@ -728,6 +730,53 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
+    def shortcut(self, model, x0, xt, t, noise, model_kwargs):
+        # xt = x_start * (1.0 - tt) + noise * tt
+
+        T = self.num_timesteps
+        B = x0.shape[0]
+        device = x0.device
+        v = x0 - noise
+
+        tt = t.unsqueeze(-1).unsqueeze(-1) / T
+
+        # Maximum allowed dt per element so that t + dt ≤ T-1
+        max_dt = (T - 1) - t  # shape (B,)
+
+        # If t == T-1, max_dt == 0, which would give no legal dt
+        # you can either:
+        # - resample those t, or
+        # - force dt=0 (no shortcut) and mask them out
+
+        # Let's ignore t == T-1 by clamping t high to T-1-1 first
+        valid_mask = max_dt > 0
+        if not valid_mask.all():
+            # Quick fix: force those t to be in [0, T-2]
+            t[~valid_mask] = T - 2
+            max_dt = (T - 1) - t
+
+        # Now max_dt ≥ 1 everywhere
+        u = torch.rand(B, device=device)
+        dt = 1 + (u * max_dt.float()).floor().long()  # dt ∈ {1,…, max_dt}
+
+        t2 = t + dt
+        assert (t2 < T).all()
+
+        #
+        B_bs = 0.5 * B
+        xt_bs = xt[:B_bs]
+        t_bs = t[:B_bs]
+        t2_bs = t2[:B_bs]
+        dt_bs = dt[:B_bs]
+        with torch.no_grad():
+            v1 = model(xt_bs, t_bs, dt_bs, **model_kwargs)
+            xt2 = xt_bs + v1 * dt_bs
+            v2 = model(xt2, t2_bs, dt_bs, **model_kwargs)
+            v_target = 0.5 * (v1+v2)
+
+        v[:B_bs] = v_target
+        return v
+
     def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
         """
         Compute training losses for a single timestep.
@@ -790,6 +839,9 @@ class GaussianDiffusion:
                 ModelMeanType.START_X: x_start,
                 ModelMeanType.EPSILON: noise,
                 ModelMeanType.VELOCITY: (x_start - noise),
+                # <--------------------------------------------------------------------------------------- shortcut here
+                # TODO: use ema here??
+                #ModelMeanType.SHORTCUT: self.shortcut(model, x_start, x_t, t, noise, model_kwargs)
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape
             terms["mse"] = mean_flat((target - model_output) ** 2)

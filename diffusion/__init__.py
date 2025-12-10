@@ -13,6 +13,7 @@ def create_diffusion(
     use_kl=False,
     sigma_small=False,
     flow_matching=False,
+    use_shortcut=False,
     predict_xstart=False,
     learn_sigma=False,
     rescale_learned_sigmas=False,
@@ -31,8 +32,11 @@ def create_diffusion(
         use_timesteps=space_timesteps(diffusion_steps, timestep_respacing),
         betas=betas,
         model_mean_type=(
-            gd.ModelMeanType.VELOCITY if flow_matching else (
-            gd.ModelMeanType.EPSILON if not predict_xstart else gd.ModelMeanType.START_X)
+            gd.ModelMeanType.SHORTCUT if (flow_matching and use_shortcut) else (
+                gd.ModelMeanType.VELOCITY if flow_matching else (
+                    gd.ModelMeanType.EPSILON if not predict_xstart else gd.ModelMeanType.START_X
+                )
+            )
         ),
         model_var_type=(
             (

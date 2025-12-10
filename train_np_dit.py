@@ -40,6 +40,7 @@ from datetime import datetime
 
 
 def ddp_setup():
+    # --- read envs from torchrun / slurm ---
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -47,9 +48,19 @@ def ddp_setup():
     is_ddp = world_size > 1
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
+    print(
+        f"[ddp_setup] RANK={rank} WORLD_SIZE={world_size} "
+        f"LOCAL_RANK={local_rank} is_ddp={is_ddp}",
+        flush=True,
+    )
+
     if is_ddp:
         torch.cuda.set_device(local_rank)
-        dist.init_process_group("nccl", timeout=timedelta(minutes=30))
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            timeout=timedelta(minutes=30),
+        )
 
     return is_ddp, device, rank, world_size, local_rank
 
@@ -117,10 +128,8 @@ def requires_grad(model, flag=True):
 
 
 def cleanup():
-    """
-    End DDP training.
-    """
-    dist.destroy_process_group()
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def create_logger(logging_dir, rank):
@@ -177,19 +186,40 @@ def main(args):
     print_gpu_info(rank, world, local_rank)
     set_seed(args.global_seed)
 
-    # Setup an experiment folder:
+    # ================== experiment dir (only rank 0 creates) ==================
+    experiment_dir = None
+    checkpoint_dir = None
+
     if rank == 0:
-        os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
-        experiment_index = len(glob(f"{args.results_dir}/{args.expname}*"))
-        experiment_index_str = f"{experiment_index:03d}"  if experiment_index > 0 else ""
-        model_string_name = args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
-        experiment_dir = f"{args.results_dir}/{args.expname}{experiment_index_str}-{model_string_name}"  # Create an experiment folder
-        checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
+        os.makedirs(args.results_dir, exist_ok=True)
+        model_string_name = args.model.replace("/", "-")
+        experiment_dir = f"{args.results_dir}/{args.expname}-{model_string_name}"
+        checkpoint_dir = f"{experiment_dir}/checkpoints"
         os.makedirs(checkpoint_dir, exist_ok=True)
-        logger = create_logger(experiment_dir, rank)
+
+    # broadcast dir names so all ranks have the same strings (even though only 0 uses them)
+    if is_ddp:
+        dir_list = [experiment_dir, checkpoint_dir]
+        dist.broadcast_object_list(dir_list, src=0)
+        experiment_dir, checkpoint_dir = dir_list
+
+    # now make logger: only rank 0 actually writes
+    logger = create_logger(experiment_dir if rank == 0 else None, rank)
+    if rank == 0:
         logger.info(f"Experiment directory created at {experiment_dir}")
-    else:
-        logger = create_logger(None, rank)
+
+    # ----- wandb -----
+    run = None
+    if (not is_ddp and rank == 0) or (is_ddp and rank == 0):
+        ts = datetime.now().strftime("M%m-D%d-H%H_M%M")
+        run_name = f"Token-DiT_{ts}"
+
+        run = wandb.init(
+            project="Generative_sampling",
+            name=run_name,
+            id=None,
+            mode="online",
+        )
 
     # Create model:
     model = DiT_models[args.model](
@@ -202,7 +232,7 @@ def main(args):
     requires_grad(ema, False)
     model = maybe_wrap_ddp(model, device, is_ddp)
 
-    diffusion = create_diffusion(timestep_respacing="", flow_matching=args.flow_matching)  # default: 1000 steps, linear noise schedule
+    diffusion = create_diffusion(timestep_respacing="", flow_matching=args.flow_matching, use_shortcut=args.use_shortcut)  # default: 1000 steps, linear noise schedule
     # vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -257,19 +287,6 @@ def main(args):
     running_loss = 0
     start_time = time()
 
-    # ----- wandb -----
-    if (not is_ddp) or rank == 0:
-        # timestamped run name
-        ts = datetime.now().strftime("M%m-D%d-H%H_M%M")
-        run_name = f"Token-DiT_{ts}"
-
-        wandb.init(
-            project="Generative_sampling",
-            name=run_name,
-            id=None,
-            mode='online'
-        )
-
     logger.info(f"Training for {args.epochs} epochs...")
     for epoch in range(args.epochs):
         logger.info(f"Beginning epoch {epoch}...")
@@ -280,6 +297,7 @@ def main(args):
                              2*x2.float()/(args.image_size-1) - 1], -1).to(device)[None].repeat(local_batch_size, 1, 1)
             x = img.to(device).reshape(local_batch_size, args.num_channels, args.image_size*args.image_size).transpose(1, 2)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
+            dt = 1 - t
             # half image training
             # model_kwargs = dict(pos=pos, ctx_pos=pos[:, :pos.shape[1]//2], ctx_x=x[:, :pos.shape[1]//2]) 
             # set context as random set of pixels (different for each sample in batch)
@@ -293,7 +311,7 @@ def main(args):
             ctx_x = x[torch.arange(local_batch_size).unsqueeze(1), ctx_idxs]
             tgt_pos = pos[torch.arange(local_batch_size).unsqueeze(1), tgt_idxs]
             tgt_x = x[torch.arange(local_batch_size).unsqueeze(1), tgt_idxs]
-            model_kwargs = dict(pos=tgt_pos, ctx_pos=ctx_pos, ctx_x=ctx_x)
+            model_kwargs = dict(pos=tgt_pos, ctx_pos=ctx_pos, ctx_x=ctx_x) #, dt=dt, sc_frac=0.25)
             loss_dict = diffusion.training_losses(model, tgt_x, t, model_kwargs)
 
             loss = loss_dict["loss"].mean()
@@ -368,6 +386,7 @@ if __name__ == "__main__":
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--flow-matching", type=bool, default=False, help="Use velocity prediction.")
+    parser.add_argument("--use-shortcut", type=bool, default=False, help="In flow matching, use shortcuts.")
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-B")
     parser.add_argument("--resume", type=str, default="", help="Path to a checkpoint to resume training from.")
     parser.add_argument("--image-size", type=int, choices=[32, 64, 128], default=64)
