@@ -8,6 +8,10 @@
 A minimal training script for DiT using PyTorch DDP.
 """
 import torch
+
+from train_np_dit import ddp_setup, print_gpu_info, set_seed, maybe_wrap_ddp
+from vis import sample_ctx_tgt_test
+
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -111,14 +115,15 @@ def main(args):
     Trains a new DiT model.
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Load a checkpoint if specified:
     checkpoint = torch.load(args.ckpt, weights_only=False)
     train_args = checkpoint["args"]
-    
-    seed = args.global_seed
-    torch.manual_seed(seed)
+
+    # Setup DDP:
+    is_ddp, device, rank, world, local_rank = ddp_setup()
+    print_gpu_info(rank, world, local_rank)
+    set_seed(args.global_seed)
     
     # Setup an experiment folder:
     os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
@@ -134,8 +139,6 @@ def main(args):
     logger.info(f"Loaded checkpoint from {args.ckpt}...")
     logger.info(f"Experiment directory created at {experiment_dir}")
 
-
-    
     # Create model:
     model = DiT_models[train_args.model](
         num_classes=train_args.num_classes,
@@ -144,6 +147,7 @@ def main(args):
     ).to(device)
     model.load_state_dict(checkpoint["model"], strict=False)
     requires_grad(model, False)  # Enable gradients for training
+    model = maybe_wrap_ddp(model, device, is_ddp)
 
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
@@ -162,14 +166,14 @@ def main(args):
     dataset = ImageFolder(args.data_path, transform=transform)
     sampler = DistributedSampler(
         dataset,
-        num_replicas=1,
-        rank=0,
+        num_replicas=world,
+        rank=rank,
         shuffle=True,
         seed=args.global_seed
     )
     loader = DataLoader(
         dataset,
-        batch_size=args.global_batch_size,
+        batch_size=int(args.global_batch_size // world),
         shuffle=False,
         sampler=sampler,
         num_workers=args.num_workers,
@@ -177,65 +181,23 @@ def main(args):
         drop_last=True
     )
 
-    pixel_idx = torch.arange(args.image_size**2, device=device)  # Used to create coordinates for images
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
     model.eval()  
     ema.eval()
 
-    
-    img = next(iter(loader))[0].to(device) # Get a batch of images
-    x1, x2 = pixel_idx//args.image_size, pixel_idx%args.image_size
-    pos = torch.stack([2*x1.float()/(args.image_size-1) - 1, 
-                        2*x2.float()/(args.image_size-1) - 1], -1).to(img.device)[None].repeat(args.global_batch_size, 1, 1)
-    x = img.to(device).reshape(args.global_batch_size, args.num_channels, args.image_size*args.image_size).transpose(1, 2)
-
-    if args.ctx_type == "none": # no ctx
-        ctx_idxs = torch.arange(0, 0*args.image_size**2//2, device=device).unsqueeze(0).repeat(args.global_batch_size, 1) 
-        model_kwargs = dict(pos=pos, ctx_pos=pos[:, :0], ctx_x=x[:, :0]) 
-    elif args.ctx_type == "half": # half image ctx
-        ctx_idxs = torch.arange(0, args.image_size**2//2, device=device).unsqueeze(0).repeat(args.global_batch_size, 1) 
-        model_kwargs = dict(pos=pos, ctx_pos=pos[:, ctx_idxs[0]], ctx_x=x[:, ctx_idxs[0]]) 
-    elif args.ctx_type == "frame": # context consisting of the pixels in the outer frame of the image (width=image_size/8)
-        ctx_upper = torch.arange(0, args.image_size**2//8, device=device)
-        ctx_lower = torch.arange(7*args.image_size**2//8, args.image_size**2, device=device)
-        ctx_left = [torch.arange(i+args.image_size**2//8, 7*args.image_size**2//8, args.image_size, device=device) for i in range(args.image_size//8)]
-        ctx_right = [torch.arange((args.image_size**2)//8+args.image_size-1-i, 7*args.image_size**2//8, args.image_size, device=device) for i in range(args.image_size//8)]
-        ctx_idxs = torch.concat([ctx_upper, ctx_lower] + ctx_left + ctx_right).unsqueeze(0).repeat(args.global_batch_size, 1) 
-        model_kwargs = dict(pos=pos, ctx_pos=pos[:, ctx_idxs[0]], ctx_x=x[:, ctx_idxs[0]]) 
-    elif args.ctx_type == "quart": # quarter image ctx
-        ctx_idxs1 = torch.arange(0, args.image_size**2//4, device=device)
-        ctx_idxs2 = torch.arange(3*args.image_size**2//4, args.image_size**2, device=device)
-        ctx_idxs = torch.concat([ctx_idxs1, ctx_idxs2]).unsqueeze(0).repeat(args.global_batch_size, 1) 
-        model_kwargs = dict(pos=pos, ctx_pos=pos[:, ctx_idxs[0]], ctx_x=x[:, ctx_idxs[0]]) 
-    else:
-        ctx_size = args.image_size**2 // 20
-        ctx_idxs = torch.cuda.FloatTensor(args.global_batch_size, args.image_size**2).uniform_().argsort(-1)[...,:ctx_size].to(img.device)
-        ctx_pos = pos[torch.arange(args.global_batch_size).unsqueeze(1), ctx_idxs]
-        ctx_x = x[torch.arange(args.global_batch_size).unsqueeze(1), ctx_idxs]
-        model_kwargs = dict(pos=pos, ctx_pos=ctx_pos, ctx_x=ctx_x)
-
     n = args.global_batch_size
     w = args.image_size
     c = args.num_channels
 
-    plt.figure(figsize=(10*n, 10*2))
-    for i in range(n):
-        plt.subplot(2, n, i + 1)
-        plt.imshow((img[i].permute(1, 2, 0).cpu().reshape(w, w, c)+1.)/2.)
-        plt.axis('off')
-        plt.subplot(2, n, n + i + 1)
-        # mask out all pixels that are not in the context
-        ctx_img = torch.ones((w*w, c), device=img.device)
-        ctx_img[ctx_idxs[i]] = img[i].permute(1, 2, 0).reshape(w*w, c)[ctx_idxs[i]]
-        plt.imshow((ctx_img.reshape(w, w, c).cpu()+1.)/2.)
-    plt.tight_layout()
-    plt.savefig(f"{experiment_dir}/input_images.png")
-    plt.close()
-    
-   
+    img = next(iter(loader))[0].to(device) # Get a batch of images
+    local_batch_size = img.shape[0]
+    img = img.to(device).reshape(local_batch_size, args.num_channels, args.image_size * args.image_size).transpose(1, 2)
+    model_kwargs, Ntgt = sample_ctx_tgt_test(img, w, "random5")
+
     all_noisy_samples = []
     T = args.timesteps
+    model_kwargs['dt'] = 500
     for s in range(args.num_samples):
         logger.info(f"Generating stochastic samples {s+1}")
         x = torch.randn(args.global_batch_size, args.image_size**2, args.num_channels, device=device)   
@@ -278,29 +240,7 @@ def main(args):
         plt.savefig(f"{experiment_dir}/det_samples{s}.png")
         plt.close()
 
-    torch.save({'samples': all_samples, 'noisy_samples': all_noisy_samples, 'ctx_idxs': ctx_idxs}, f"{experiment_dir}/samples.pt")
-
-
-    plt.figure(figsize=(10*n, 10*(2+2*args.num_samples)))
-    for i in range(n):
-        plt.subplot(2+2*args.num_samples, n, i + 1)
-        plt.imshow((img[i].permute(1, 2, 0).cpu().reshape(w, w, c)+1.)/2.)
-        plt.axis('off')
-        plt.subplot(2+2*args.num_samples, n, n + i + 1)
-        # mask out all pixels that are not in the context
-        ctx_img = torch.ones((w*w, c), device=img.device)
-        ctx_img[ctx_idxs[i]] = img[i].permute(1, 2, 0).reshape(w*w, c)[ctx_idxs[i]]
-        plt.imshow((ctx_img.reshape(w, w, c).cpu()+1.)/2.)
-        
-        for s in range(args.num_samples):
-            plt.subplot(2+2*args.num_samples, n, (2+s) * n + i + 1)
-            plt.imshow((all_samples[s][i].reshape(w, w, c)+1.)/2.)
-            plt.axis('off')
-        
-        for s in range(args.num_samples):
-            plt.subplot(2+2*args.num_samples, n, (2+args.num_samples+s) * n + i + 1)
-            plt.imshow((all_noisy_samples[s][i].reshape(w, w, c)+1.)/2.)
-            plt.axis('off')
+    torch.save({'samples': all_samples, 'noisy_samples': all_noisy_samples}, f"{experiment_dir}/samples.pt")
 
     plt.tight_layout()
     plt.savefig(f"{experiment_dir}/all_samples.png")
