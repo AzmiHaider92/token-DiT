@@ -182,16 +182,17 @@ def sample_timesteps(
     shortcut_mode: str = "integer",   # "integer" | "dyadic" | "dyadic_full"
 ):
     """
-    Sample (t, dt) for FM + shortcut training, with integer time.
+    Sample (t, dt) for FM + shortcut training, with *normalized* time.
 
     Conventions:
-        - Forward diffusion time indices: 0 ... T-1
-        - Shortcut is a backward jump: t2 = t - dt
-        - dt > 0  => shortcut example, with jump length dt (integer steps)
+        - Internal integer indices: 0 ... T-1
+        - Exposed t, dt are in [0, 1], as floats.
+        - Shortcut is a backward jump: t2 = t - dt  (in normalized units)
+        - dt > 0  => shortcut example, with jump length dt
         - dt == 0 => pure FM example (no shortcut)
 
     Args:
-        T: total number of timesteps (integer).
+        T: total number of discrete timesteps (integer).
         shape: e.g. x.shape; only shape[0] (batch size) is used.
         device: a torch.device.
         use_shortcut: enable shortcut sampling if True.
@@ -199,58 +200,54 @@ def sample_timesteps(
                        First B_sc examples will be shortcut; rest FM.
         shortcut_mode:
             - "integer":
-                dt ∈ {1, ..., T-1}
-                t ∈ {dt, ..., T-1}
+                dt_idx ∈ {1, ..., T-1}
+                t_idx ∈ {dt_idx, ..., T-1}
             - "dyadic":
-                dt ∈ {1, 2, 4, ..., 2^k ≤ T-1}
-                t is multiple of dt: t ∈ {dt, 2dt, ..., ≤ T-1}
+                dt_idx ∈ {1, 2, 4, ..., 2^k ≤ T-1}
+                t_idx is multiple of dt_idx: t_idx ∈ {dt_idx, 2dt_idx, ..., ≤ T-1}
             - "dyadic_full":
-                same as "dyadic" but also includes full-path jump dt = T-1.
+                same as "dyadic" but also includes full-path jump dt_idx = T-1.
 
     Returns:
-        t:  LongTensor of shape (B,)  in [0, T-1]
-        dt: LongTensor of shape (B,)  with dt >= 0
-            dt == 0 for FM-only examples
-            dt > 0 for shortcut examples
+        t:  FloatTensor of shape (B,) in [0, 1]
+        dt: FloatTensor of shape (B,) in [0, 1], dt == 0 for FM, > 0 for shortcut.
     """
     B = shape[0]
-    dt_min = 1/T
 
     # --- default: FM everywhere ---
-    # FM timesteps: uniform over [0, 1]
-    t = torch.randint(low=0, high=T, size=(B,), device=device)
-    t = t / float(T)
-    dt = torch.zeros(B, dtype=torch.long, device=device)
+    # FM time indices: uniform over {0, ..., T-1}
+    t_idx = torch.randint(low=0, high=T, size=(B,), device=device)
+    # normalized t in [0,1)
+    t = t_idx.float() / float(T)
 
-    return t, dt
+    # dt = 0 means "no shortcut" / pure FM, in normalized units
+    dt = torch.zeros(B, dtype=torch.float32, device=device)
 
-    """
     if (not use_shortcut) or (T <= 1) or (B == 0):
         return t, dt
 
-    # how many examples will use shortcut
-    shortcut_frac_clamped = max(0.0, min(1.0, float(shortcut_frac)))
-    B_sc = int(B * shortcut_frac_clamped)
+    # --- shortcut: only a fraction of the batch ---
+    B_sc = int(B * float(shortcut_frac))
     if B_sc == 0:
         return t, dt
 
-    # ---------- 1) Build dt_choices for shortcut part ----------
+    # ---------- 1) Build dt_choices (integer indices) for shortcut part ----------
     if shortcut_mode == "integer":
-        # dt ∈ {1, ..., T-1}
+        # dt_idx ∈ {1, ..., T-1}
         dt_choices = torch.arange(1, T, device=device, dtype=torch.long)
 
     elif shortcut_mode in ("dyadic", "dyadic_full"):
-        # dyadic dt: {1, 2, 4, ..., 2^k <= T-1}
-        max_pow = int(math.log2(T - 1))  # T>1 here
+        # dyadic dt_idx: {1, 2, 4, ..., 2^k <= T-1}
+        max_pow = int(math.log2(T - 1))  # T > 1 here
         powers = torch.tensor(
             [2 ** k for k in range(max_pow + 1)],
             device=device,
-            dtype=torch.long
+            dtype=torch.long,
         )
         powers = powers[powers <= (T - 1)]
 
         if shortcut_mode == "dyadic_full":
-            # explicitly include full-path jump dt = T-1 as well
+            # explicitly include full-path jump dt_idx = T-1 as well
             full_jump = torch.tensor([T - 1], device=device, dtype=torch.long)
             dt_choices = torch.unique(torch.cat([powers, full_jump]))
         else:
@@ -261,42 +258,44 @@ def sample_timesteps(
 
     # safety: ensure dt_choices not empty
     if dt_choices.numel() == 0:
-        # fallback to FM-only if something degenerate happens
         return t, dt
 
-    # ---------- 2) Sample dt for the shortcut part (first B_sc) ----------
+    # ---------- 2) Sample dt_idx for the shortcut part ----------
     choice_idx = torch.randint(
         low=0,
         high=dt_choices.numel(),
         size=(B_sc,),
-        device=device
+        device=device,
     )
-    dt_sc = dt_choices[choice_idx]  # shape (B_sc,)
+    dt_idx_sc = dt_choices[choice_idx]  # (B_sc,)
 
-    # ---------- 3) Sample t for the shortcut part given dt_sc ----------
+    # ---------- 3) Sample t_idx for the shortcut part given dt_idx_sc ----------
     if shortcut_mode == "integer":
-        # t_sc ∈ {dt_sc, ..., T-1}, contiguous
-        max_offset = T - dt_sc           # >= 1 because dt_sc <= T-1
+        # t_idx_sc ∈ {dt_idx_sc, ..., T-1} (contiguous)
+        max_offset = T - dt_idx_sc              # >= 1 because dt_idx_sc <= T-1
         u = torch.rand(B_sc, device=device)
         offset = (u * max_offset.float()).floor().long()  # 0 ... max_offset-1
-        t_sc = dt_sc + offset
+        t_idx_sc = dt_idx_sc + offset
 
     else:  # "dyadic" or "dyadic_full"
-        # t_sc must be a multiple of dt_sc: t_sc = m * dt_sc,
-        # with m ∈ {1, ..., floor((T-1)/dt_sc)} to keep t_sc <= T-1
-        max_m = (T - 1) // dt_sc         # shape (B_sc,), each >= 1
+        # t_idx_sc must be multiple of dt_idx_sc: t_idx_sc = m * dt_idx_sc,
+        # with m ∈ {1, ..., floor((T-1)/dt_idx_sc)} so t_idx_sc <= T-1
+        max_m = (T - 1) // dt_idx_sc           # shape (B_sc,), each >= 1
         u = torch.rand(B_sc, device=device)
         m = 1 + (u * max_m.float()).floor().long()  # 1..max_m[i]
-        t_sc = m * dt_sc                 # shape (B_sc,), guaranteed in [dt_sc, T-1]
+        t_idx_sc = m * dt_idx_sc               # ∈ [dt_idx_sc, T-1]
 
-    # ---------- 4) Mix shortcut and FM ----------
+    # ---------- 4) Convert indices -> normalized times ----------
+    t_sc = t_idx_sc.float() / float(T)      # in [0,1)
+    dt_sc = dt_idx_sc.float() / float(T)    # in (0,1]
+
+    # ---------- 5) Mix shortcut and FM ----------
     t[:B_sc] = t_sc
     dt[:B_sc] = dt_sc
-    # t[B_sc:] remain FM: uniform [0, T-1]
-    # dt[B_sc:] remain 0
+    # t[B_sc:] stays FM (random in [0,1))
+    # dt[B_sc:] stays 0.0
 
     return t, dt
-    """
 
 
 #################################################################################
@@ -318,10 +317,23 @@ def main(args):
     experiment_dir = None
     checkpoint_dir = None
 
+    # ----- wandb -----
+    run = None
+    ts = datetime.now().strftime("M%m-D%d-H%H_M%M")
+    run_name = f"Token-DiT_{args.expname}_{ts}"
+
+    if (not is_ddp and rank == 0) or (is_ddp and rank == 0):
+        run = wandb.init(
+            project="Generative_sampling",
+            name=run_name,
+            id=None,
+            mode="online",
+        )
+
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)
         model_string_name = args.model.replace("/", "-")
-        experiment_dir = f"{args.results_dir}/{args.expname}-{model_string_name}"
+        experiment_dir = f"{args.results_dir}/{run_name}"
         checkpoint_dir = f"{experiment_dir}/checkpoints"
         os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -336,18 +348,6 @@ def main(args):
     if rank == 0:
         logger.info(f"Experiment directory created at {experiment_dir}")
 
-    # ----- wandb -----
-    run = None
-    if (not is_ddp and rank == 0) or (is_ddp and rank == 0):
-        ts = datetime.now().strftime("M%m-D%d-H%H_M%M")
-        run_name = f"Token-DiT_{args.expname}_{ts}"
-
-        run = wandb.init(
-            project="Generative_sampling",
-            name=run_name,
-            id=None,
-            mode="online",
-        )
 
     # Create model:
     model = DiT_models[args.model](
@@ -516,7 +516,7 @@ if __name__ == "__main__":
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--flow-matching", type=bool, default=False, help="Use velocity prediction.")
-    parser.add_argument("--train-T", type=int, default=1024)
+    parser.add_argument("--train-T", type=int, default=1000)
     parser.add_argument("--use-shortcut", type=bool, default=False, help="In flow matching, use shortcuts.")
     parser.add_argument("--shortcut-mode", type=str, choices=["integer", "dyadic", "dyadic_full"], default="integer")
     parser.add_argument("--shortcut-frac", type=float, default=0.25)

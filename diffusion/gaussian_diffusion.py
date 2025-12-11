@@ -743,46 +743,47 @@ class GaussianDiffusion:
                 sub_dict[k] = v
         return sub_dict
 
-    def shortcut_targets(self, model, x0, xt, t, noise, model_kwargs, sc_frac):
+    def shortcut_targets(self, model, x1, xt, t, noise, model_kwargs, sc_frac):
         # xt = x0 * (1.0 - tt) + noise * tt
 
-        T = self.num_timesteps
-        B = x0.shape[0]
-        device = x0.device
+        B = x1.shape[0]
+        device = x1.device
         dt = model_kwargs["dt"]
-        B_bs = int(B * sc_frac)
+        B_sc = int(B * sc_frac)
 
         # base flow-matching target
-        v = x0 - noise
+        v = x1 - noise
 
-        half_dt = (0.5 * dt).int()
-        # backward in time: t2 = t - dt
-        t2 = (t - half_dt)
-        assert (t2-half_dt >= 0).all()
+        half_dt = 0.5 * dt
+
+        # forward in time: t2 = t + dt/2
+        t2 = (t + half_dt)
+        assert (t2 + half_dt <= 1).all()
 
         # use 0.25 of the batch for shortcut bootstrap
-        xt_bs = xt[:B_bs]
-        t_bs = t[:B_bs]
-        t2_bs = t2[:B_bs]
-        half_dt = half_dt[:B_bs]  # positive step-size (magnitude)
-        model_kwargs_Bs = self._sub_kwargs(model_kwargs, B_bs)
-
+        xt_bs = xt[:B_sc]
+        t_bs = t[:B_sc]
+        t2_bs = t2[:B_sc]
+        half_dt = half_dt[:B_sc]  # positive step-size (magnitude)
+        model_kwargs_Bs = self._sub_kwargs(model_kwargs, B_sc)
+        model_kwargs_Bs["dt"] = half_dt
         # broadcast dt as scalar step-size for xt update
         half_dt_broadcast = half_dt.view(-1, *([1] * (xt_bs.ndim - 1))).float()
 
         with torch.no_grad():
-            # teacher velocities along a backward jump of size dt
+            # teacher velocities along a forward jump of size dt/2
             v1 = model(xt_bs, t_bs, **model_kwargs_Bs)
-            # backward step in x: x(t2) ≈ x(t) + dt * v
-            step = half_dt_broadcast / T
-            xt2 = xt_bs + step * v1
+            # forward step in x: x(t2) ≈ x(t) + dt/2 * v
+            xt2 = xt_bs + half_dt_broadcast * v1
             xt2 = torch.clamp(xt2, -4.0, 4.0)
 
+            # another half jump
             v2 = model(xt2, t2_bs, **model_kwargs_Bs)
             v_target = 0.5 * (v1 + v2)
         v_target = torch.clamp(v_target, -4.0, 4.0)
+
         # replace targets for first half of batch by shortcut teacher
-        v[:B_bs] = v_target
+        v[:B_sc] = v_target
         return v
 
     def training_losses(self, model, x_start, t, model_kwargs=None, noise=None, sc_frac=0.25):
