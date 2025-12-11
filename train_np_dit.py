@@ -214,13 +214,17 @@ def sample_timesteps(
             dt > 0 for shortcut examples
     """
     B = shape[0]
+    dt_min = 1/T
 
     # --- default: FM everywhere ---
-    # FM timesteps: uniform over [0, T-1]
-    t = torch.randint(0, T, (B,), device=device)
-    # dt = 0 means "no shortcut" / pure FM
+    # FM timesteps: uniform over [0, 1]
+    t = torch.randint(low=0, high=T, size=(B,), device=device)
+    t = t / float(T)
     dt = torch.zeros(B, dtype=torch.long, device=device)
 
+    return t, dt
+
+    """
     if (not use_shortcut) or (T <= 1) or (B == 0):
         return t, dt
 
@@ -292,6 +296,7 @@ def sample_timesteps(
     # dt[B_sc:] remain 0
 
     return t, dt
+    """
 
 
 #################################################################################

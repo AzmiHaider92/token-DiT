@@ -225,7 +225,7 @@ def validate(
     # loop to denoise
     for t in range(T):
         with torch.no_grad():
-            pred = model(x, torch.Tensor([T - t] * x.shape[0]).to(device), **model_kwargs)
+            pred = model(x, torch.Tensor([t/T] * x.shape[0]).to(device), **model_kwargs)
         if deterministic:
             alpha = 1.
             sigma = 0.

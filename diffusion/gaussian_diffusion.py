@@ -217,25 +217,27 @@ class GaussianDiffusion:
         log_variance = _extract_into_tensor(self.log_one_minus_alphas_cumprod, t, x_start.shape)
         return mean, variance, log_variance
 
-    def q_sample(self, x_start, t, noise=None):
+    def q_sample(self, x1, t, noise=None):
         """
         Diffuse the data for a given number of diffusion steps.
-        In other words, sample from q(x_t | x_0).
-        :param x_start: the initial data batch.
+        In other words, sample from q(x_t | x_1).
+        :param x1: the initial data batch - clean images
         :param t: the number of diffusion steps (minus 1). Here, 0 means one step.
         :param noise: if specified, the split-out normal noise.
         :return: A noisy version of x_start.
         """
         if noise is None:
-            noise = th.randn_like(x_start)
-        assert noise.shape == x_start.shape
+            noise = th.randn_like(x1)
+        assert noise.shape == x1.shape
         if self.model_mean_type == ModelMeanType.VELOCITY or self.model_mean_type == ModelMeanType.SHORTCUT:
-            tt = t.unsqueeze(-1).unsqueeze(-1) / self.num_timesteps
-            return x_start * (1.0 - tt) + noise * tt
+            # edits: t is already normalized [0,1]. The correct direction is: x1=clean, x0=noise
+            tt = t.unsqueeze(-1).unsqueeze(-1) #/ self.num_timesteps
+            return noise * (1.0 - tt) + x1 * tt
         else:
+            # TODO: I reversed the convention - this might not work. Work on velocity and shortcut only
             return (
-             _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-              + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
+             _extract_into_tensor(self.sqrt_alphas_cumprod, t, x1.shape) * x1
+              + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x1.shape) * noise
             )
 
     def q_posterior_mean_variance(self, x_start, x_t, t):
@@ -795,6 +797,12 @@ class GaussianDiffusion:
         :return: a dict with the key "loss" containing a tensor of shape [N].
                  Some mean or variance settings may also have other keys.
         """
+
+        #######################
+        # edits: (1) t (and dt) is normalized - [0,1]
+        #        (2) x1 is the clean image, x0 is noise - direction reversed
+        #######################
+
         if model_kwargs is None:
             model_kwargs = {}
         if noise is None:
@@ -806,9 +814,9 @@ class GaussianDiffusion:
             target = self.shortcut_targets(model, x_start, x_t, t, noise, model_kwargs, sc_frac)
         else:
             target = {
-                ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
-                    x_start=x_start, x_t=x_t, t=t
-                )[0],
+                #ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
+                #    x_start=x_start, x_t=x_t, t=t
+                #)[0],
                 ModelMeanType.START_X: x_start,
                 ModelMeanType.EPSILON: noise,
                 ModelMeanType.VELOCITY: (x_start - noise),
@@ -816,48 +824,48 @@ class GaussianDiffusion:
 
         # generate model output and calculate loss
         terms = {}
-        if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
-            terms["loss"] = self._vb_terms_bpd(
-                model=model,
-                x_start=x_start,
-                x_t=x_t,
-                t=t,
-                clip_denoised=False,
-                model_kwargs=model_kwargs,
-            )["output"]
-            if self.loss_type == LossType.RESCALED_KL:
-                terms["loss"] *= self.num_timesteps
-        elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
+        #if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
+        #    terms["loss"] = self._vb_terms_bpd(
+        #        model=model,
+        #        x_start=x_start,
+        #        x_t=x_t,
+        #        t=t,
+        #        clip_denoised=False,
+        #        model_kwargs=model_kwargs,
+        #    )["output"]
+        #    if self.loss_type == LossType.RESCALED_KL:
+        #        terms["loss"] *= self.num_timesteps
+        if self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
             model_output = model(x_t, t, **model_kwargs)
-            if self.model_var_type in [
-                ModelVarType.LEARNED,
-                ModelVarType.LEARNED_RANGE,
-            ]:
-                B, T, C = x_t.shape
-                assert model_output.shape == (B, T, C * 2)
-                model_output, model_var_values = th.split(model_output, C, dim=-1)
-                # Learn the variance using the variational bound, but don't let
-                # it affect our mean prediction.
-                frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
-                terms["vb"] = self._vb_terms_bpd(
-                    model=lambda *args, r=frozen_out: r,
-                    x_start=x_start,
-                    x_t=x_t,
-                    t=t,
-                    clip_denoised=False,
-                )["output"]
-                if self.loss_type == LossType.RESCALED_MSE:
-                    # Divide by 1000 for equivalence with initial implementation.
-                    # Without a factor of 1/1000, the VB term hurts the MSE term.
-                    terms["vb"] *= self.num_timesteps / 1000.0
+            #if self.model_var_type in [
+            #    ModelVarType.LEARNED,
+            #    ModelVarType.LEARNED_RANGE,
+            #]:
+            #    B, T, C = x_t.shape
+            #    assert model_output.shape == (B, T, C * 2)
+            #    model_output, model_var_values = th.split(model_output, C, dim=-1)
+            #    # Learn the variance using the variational bound, but don't let
+            #    # it affect our mean prediction.
+            #    frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
+            #    terms["vb"] = self._vb_terms_bpd(
+            #        model=lambda *args, r=frozen_out: r,
+            #        x_start=x_start,
+            #        x_t=x_t,
+            #        t=t,
+            #        clip_denoised=False,
+            #    )["output"]
+            #    if self.loss_type == LossType.RESCALED_MSE:
+            #        # Divide by 1000 for equivalence with initial implementation.
+            #        # Without a factor of 1/1000, the VB term hurts the MSE term.
+            #        terms["vb"] *= self.num_timesteps / 1000.0
 
             assert model_output.shape == target.shape == x_start.shape
             terms["mse"] = mean_flat((target - model_output) ** 2)
             #print(ModelMeanType, tt)
-            if "vb" in terms:
-                terms["loss"] = terms["mse"] + terms["vb"]
-            else:
-                terms["loss"] = terms["mse"]
+            #if "vb" in terms:
+            #    terms["loss"] = terms["mse"] + terms["vb"]
+            #else:
+            terms["loss"] = terms["mse"]
         else:
             raise NotImplementedError(self.loss_type)
 
