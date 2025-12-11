@@ -208,7 +208,8 @@ def validate(
     savedir,
     step,
     T=1000,
-    ctx_type="half"
+    ctx_type="half",
+    deterministic=False
 ):
 
     model.eval()
@@ -225,8 +226,12 @@ def validate(
     for t in range(T):
         with torch.no_grad():
             pred = model(x, torch.Tensor([T - t] * x.shape[0]).to(device), **model_kwargs)
-        alpha = 1 + t / T * (1 - t / T)
-        sigma = 0.2 * (t / T * (1 - t / T)) ** 0.5
+        if deterministic:
+            alpha = 1.
+            sigma = 0.
+        else: # stochastic
+            alpha = 1 + t / T * (1 - t / T)
+            sigma = 0.2 * (t / T * (1 - t / T)) ** 0.5
         x += (alpha * pred + sigma * torch.randn_like(x).to(x.device)) / T
         x = x.clamp_(-1., 1.)
 
