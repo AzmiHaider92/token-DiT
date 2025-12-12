@@ -758,7 +758,6 @@ class GaussianDiffusion:
 
         # forward in time: t2 = t + dt/2
         t2 = (t + half_dt)
-        assert (t2 + half_dt <= 1).all()
 
         # use 0.25 of the batch for shortcut bootstrap
         xt_bs = xt[:B_sc]

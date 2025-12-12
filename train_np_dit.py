@@ -187,7 +187,7 @@ def sample_timesteps(
     Conventions:
         - Internal integer indices: 0 ... T-1
         - Exposed t, dt are in [0, 1], as floats.
-        - Shortcut is a backward jump: t2 = t - dt  (in normalized units)
+        - Shortcut is a *forward* jump: t2 = t + dt  (normalized units)
         - dt > 0  => shortcut example, with jump length dt
         - dt == 0 => pure FM example (no shortcut)
 
@@ -201,16 +201,17 @@ def sample_timesteps(
         shortcut_mode:
             - "integer":
                 dt_idx ∈ {1, ..., T-1}
-                t_idx ∈ {dt_idx, ..., T-1}
+                t_idx ∈ {0, ..., T-1-dt_idx}
             - "dyadic":
                 dt_idx ∈ {1, 2, 4, ..., 2^k ≤ T-1}
-                t_idx is multiple of dt_idx: t_idx ∈ {dt_idx, 2dt_idx, ..., ≤ T-1}
+                t_idx = m * dt_idx, m ∈ {0, ..., floor((T-1-dt_idx)/dt_idx)}
             - "dyadic_full":
                 same as "dyadic" but also includes full-path jump dt_idx = T-1.
 
     Returns:
-        t:  FloatTensor of shape (B,) in [0, 1]
+        t:  FloatTensor of shape (B,) in [0, 1)
         dt: FloatTensor of shape (B,) in [0, 1], dt == 0 for FM, > 0 for shortcut.
+            For all i, t[i] + dt[i] ≤ 1 - 1/T  (up to float rounding).
     """
     B = shape[0]
 
@@ -271,19 +272,23 @@ def sample_timesteps(
 
     # ---------- 3) Sample t_idx for the shortcut part given dt_idx_sc ----------
     if shortcut_mode == "integer":
-        # t_idx_sc ∈ {dt_idx_sc, ..., T-1} (contiguous)
-        max_offset = T - dt_idx_sc              # >= 1 because dt_idx_sc <= T-1
+        # Need t_idx_sc + dt_idx_sc <= T-1
+        # => t_idx_sc ∈ {0, ..., T-1-dt_idx_sc}
+        max_offset = T - dt_idx_sc                   # ≥ 1 because dt_idx_sc ≤ T-1
         u = torch.rand(B_sc, device=device)
-        offset = (u * max_offset.float()).floor().long()  # 0 ... max_offset-1
-        t_idx_sc = dt_idx_sc + offset
+        # t_idx_sc ∈ {0, ..., max_offset-1} = {0, ..., T-1-dt_idx_sc}
+        t_idx_sc = (u * max_offset.float()).floor().long()
 
     else:  # "dyadic" or "dyadic_full"
-        # t_idx_sc must be multiple of dt_idx_sc: t_idx_sc = m * dt_idx_sc,
-        # with m ∈ {1, ..., floor((T-1)/dt_idx_sc)} so t_idx_sc <= T-1
-        max_m = (T - 1) // dt_idx_sc           # shape (B_sc,), each >= 1
+        # t_idx_sc must be multiple of dt_idx_sc: t_idx_sc = m * dt_idx_sc
+        # and t_idx_sc + dt_idx_sc <= T-1
+        # => m * dt_idx_sc <= T-1 - dt_idx_sc
+        # => m <= floor((T-1-dt_idx_sc) / dt_idx_sc) =: max_m
+        max_m = (T - 1 - dt_idx_sc) // dt_idx_sc     # shape (B_sc,), each >= 0
         u = torch.rand(B_sc, device=device)
-        m = 1 + (u * max_m.float()).floor().long()  # 1..max_m[i]
-        t_idx_sc = m * dt_idx_sc               # ∈ [dt_idx_sc, T-1]
+        # m ∈ {0, ..., max_m[i]}
+        m = (u * (max_m.float() + 1.0)).floor().long()
+        t_idx_sc = m * dt_idx_sc
 
     # ---------- 4) Convert indices -> normalized times ----------
     t_sc = t_idx_sc.float() / float(T)      # in [0,1)
@@ -292,8 +297,9 @@ def sample_timesteps(
     # ---------- 5) Mix shortcut and FM ----------
     t[:B_sc] = t_sc
     dt[:B_sc] = dt_sc
-    # t[B_sc:] stays FM (random in [0,1))
-    # dt[B_sc:] stays 0.0
+
+    # Optionally: sanity check, allow small epsilon for float error
+    assert ((t + dt) <= 1.0 + 1e-6).all()
 
     return t, dt
 
