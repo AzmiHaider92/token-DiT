@@ -314,6 +314,7 @@ def main(args):
         for T in T_list:
             # If shortcut expects dt, set it per sample
             if getattr(train_args, "use_shortcut", False):
+                print("using shortcuts ...")
                 model_kwargs["dt"] = torch.full((B_local,), 1.0 / float(T), device=device)
 
             # x is ALL pixels now
@@ -382,7 +383,7 @@ if __name__ == "__main__":
     # VIZ controls
     parser.add_argument("--viz-batches", type=int, default=4)
     parser.add_argument("--viz-n-examples", type=int, default=8)
-    parser.add_argument("--T-list", type=str, default="1,2,10,100")
+    parser.add_argument("--T-list", type=str, default="1,2,10,100,1000")
 
     args = parser.parse_args()
     main(args)
