@@ -140,7 +140,6 @@ def main(args):
 
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)
-        model_string_name = args.model.replace("/", "-")
         experiment_dir = f"{args.results_dir}/{run_name}"
         checkpoint_dir = f"{experiment_dir}/checkpoints"
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -150,11 +149,6 @@ def main(args):
         dir_list = [experiment_dir, checkpoint_dir]
         dist.broadcast_object_list(dir_list, src=0)
         experiment_dir, checkpoint_dir = dir_list
-
-    # now make logger: only rank 0 actually writes
-    logger = create_logger(experiment_dir if rank == 0 else None, rank)
-    if rank == 0:
-        logger.info(f"Experiment directory created at {experiment_dir}")
 
     # Create model:
     model = DiT_models[train_args.model](
@@ -170,8 +164,6 @@ def main(args):
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     ema.load_state_dict(checkpoint["ema"], strict=False)
     requires_grad(ema, False)
-    
-    logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup data:
     transform = transforms.Compose([
@@ -198,8 +190,6 @@ def main(args):
         drop_last=True
     )
 
-    logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
-
     model.eval()  
     ema.eval()
 
@@ -214,8 +204,9 @@ def main(args):
 
     all_noisy_samples = []
     T = args.timesteps
+    print(f"T={T}")
     model_kwargs['dt'] = torch.Tensor([1/T] * n).to(device)
-    logger.info(f"Generating stochastic samples")
+    print(f"Generating stochastic samples")
     x = torch.randn(n, Ntgt, c, device=device)
     # loop to denoise
     for t in range(T):
@@ -226,6 +217,7 @@ def main(args):
         x += (alpha * pred + sigma * torch.randn_like(x).to(x.device)) / T
         x = x.clamp_(-1., 1.)
 
+    print("Done generating samples.")
     x = x.detach()
 
     imgs = build_ctx_tgt_viz_images(
@@ -247,8 +239,7 @@ def main(args):
 
     save_path = f"{experiment_dir}/stochastic_samples.png"
     save_image(grid, save_path)
-    logger.info("Done!")
-    
+
 
 
 if __name__ == "__main__":
