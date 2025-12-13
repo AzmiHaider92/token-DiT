@@ -485,7 +485,8 @@ def main(args):
                              experiment_dir,
                              train_steps,
                              args.sample_T,
-                             args.sample_ctx_type)
+                             args.sample_ctx_type,
+                             args.use_shortcut)
 
             # Save DiT checkpoint:
             if (train_steps % args.ckpt_every == 0 and train_steps > 0):

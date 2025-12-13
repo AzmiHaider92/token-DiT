@@ -209,6 +209,7 @@ def validate(
     step,
     T=1000,
     ctx_type="half",
+    use_shortcut=False,
     deterministic=False
 ):
 
@@ -220,7 +221,8 @@ def validate(
     # batch
     model_kwargs, Ntgt = sample_ctx_tgt_test(img, img_size, ctx_type=ctx_type)
     x = torch.randn(B, Ntgt, C, device=device)
-    model_kwargs['dt'] = torch.Tensor([1/T] * x.shape[0]).to(device)
+    if use_shortcut:
+        model_kwargs['dt'] = torch.Tensor([1 / T] * B).to(device)
 
     # loop to denoise
     for t in range(T):

@@ -206,15 +206,16 @@ def main(args):
     all_noisy_samples = []
     T = args.timesteps
     print(f"T={T}")
-    model_kwargs['dt'] = torch.Tensor([1/T] * n).to(device)
+    if train_args.use_shortcut:
+        model_kwargs['dt'] = torch.Tensor([1/T] * n).to(device)
     print(f"Generating stochastic samples")
     x = torch.randn(n, Ntgt, c, device=device)
     # loop to denoise
     for t in tqdm(range(T)):
         with torch.no_grad():
             pred = model(x, torch.Tensor([t / T] * x.shape[0]).to(device), **model_kwargs)
-        alpha = 1 + t / T * (1 - t / T)
-        sigma = 0.2 * (t / T * (1 - t / T)) ** 0.5
+        alpha = 1.0 # 1 + t / T * (1 - t / T)
+        sigma = 0.0 # 0.2 * (t / T * (1 - t / T)) ** 0.5
         x += (alpha * pred + sigma * torch.randn_like(x).to(x.device)) / T
         x = x.clamp_(-1., 1.)
 
