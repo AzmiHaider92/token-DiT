@@ -311,6 +311,7 @@ def main(args):
 
         preds_by_T = []
 
+        x0 = torch.randn(B_local, N_all, C, device=device)
         for T in T_list:
             # If shortcut expects dt, set it per sample
             if getattr(train_args, "use_shortcut", False):
@@ -318,7 +319,7 @@ def main(args):
                 model_kwargs["dt"] = torch.full((B_local,), 1.0 / float(T), device=device)
 
             # x is ALL pixels now
-            x = torch.randn(B_local, N_all, C, device=device)
+            x = x0.clone()
 
             # integrate
             for t in range(T):
