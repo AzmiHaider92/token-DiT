@@ -261,6 +261,6 @@ if __name__ == "__main__":
     parser.add_argument("--timesteps", type=int, default=1000)
     parser.add_argument("--num_samples", type=int, default=3)
     parser.add_argument("--ctx_type", type=str, choices=["none", "half", "quart", "frame", "random"], default="random")
-    parser.add_argument("--ctx-rand-perc", type=int, default=0.05)
+    parser.add_argument("--ctx-rand-perc", type=float, default=0.05)
     args = parser.parse_args()
     main(args)
