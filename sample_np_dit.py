@@ -7,10 +7,12 @@
 """
 A minimal training script for DiT using PyTorch DDP.
 """
+from datetime import datetime
+
 import torch
 
 from train_np_dit import ddp_setup, print_gpu_info, set_seed, maybe_wrap_ddp
-from vis import sample_ctx_tgt_test
+from vis import sample_ctx_tgt_test, build_ctx_tgt_viz_images
 
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -33,10 +35,12 @@ import argparse
 import logging
 import os
 import matplotlib.pyplot as plt
+import torchvision.utils as vutils
 
 from latent_token_models import DiT_models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
+from torchvision.utils import save_image, make_grid
 
 
 #################################################################################
@@ -124,20 +128,33 @@ def main(args):
     is_ddp, device, rank, world, local_rank = ddp_setup()
     print_gpu_info(rank, world, local_rank)
     set_seed(args.global_seed)
-    
-    # Setup an experiment folder:
-    os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
-    experiment_index = len(glob(f"{args.results_dir}/{args.expname}*"))
-    experiment_index_str = f"{experiment_index:03d}"  if experiment_index > 0 else ""
-    model_string_name = train_args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
-    experiment_dir = f"{args.results_dir}/{args.expname}{experiment_index_str}-{model_string_name}"  # Create an experiment folder
-    checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    logger = create_logger(experiment_dir)
-    logger.info(f"{' '.join(os.sys.argv)}")
-    logger.info(f"args: {args}")
-    logger.info(f"Loaded checkpoint from {args.ckpt}...")
-    logger.info(f"Experiment directory created at {experiment_dir}")
+
+    # ================== experiment dir (only rank 0 creates) ==================
+    experiment_dir = None
+    checkpoint_dir = None
+
+    # ----- wandb -----
+    run = None
+    ts = datetime.now().strftime("M%m-D%d-H%H_M%M")
+    run_name = f"Sampling_{args.expname}_{ts}"
+
+    if rank == 0:
+        os.makedirs(args.results_dir, exist_ok=True)
+        model_string_name = args.model.replace("/", "-")
+        experiment_dir = f"{args.results_dir}/{run_name}"
+        checkpoint_dir = f"{experiment_dir}/checkpoints"
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+    # broadcast dir names so all ranks have the same strings (even though only 0 uses them)
+    if is_ddp:
+        dir_list = [experiment_dir, checkpoint_dir]
+        dist.broadcast_object_list(dir_list, src=0)
+        experiment_dir, checkpoint_dir = dir_list
+
+    # now make logger: only rank 0 actually writes
+    logger = create_logger(experiment_dir if rank == 0 else None, rank)
+    if rank == 0:
+        logger.info(f"Experiment directory created at {experiment_dir}")
 
     # Create model:
     model = DiT_models[train_args.model](
@@ -197,54 +214,39 @@ def main(args):
 
     all_noisy_samples = []
     T = args.timesteps
-    model_kwargs['dt'] = 500
-    for s in range(args.num_samples):
-        logger.info(f"Generating stochastic samples {s+1}")
-        x = torch.randn(args.global_batch_size, args.image_size**2, args.num_channels, device=device)   
-        for t in range(T):
-            with torch.no_grad():
-                pred = model(x, torch.Tensor([T-t]*x.shape[0]).to(device), **model_kwargs)
-            alpha = 1+t/T*(1-t/T)
-            sigma = 0.2*(t/T*(1-t/T))**0.5
-            x += (alpha*pred + sigma*torch.randn_like(x).to(x.device))/T    
-            x = x.clamp_(-1., 1.)    
-        all_noisy_samples.append(x.cpu().numpy())
-        plt.figure(figsize=(10*n, 10))
-        for i in range(n):
-            plt.subplot(1, n, i + 1)
-            plt.imshow((all_noisy_samples[s][i].reshape(w, w, c)+1.)/2.)
-            plt.axis('off')
-        plt.tight_layout()
-        plt.savefig(f"{experiment_dir}/noisy_samples{s}.png")
-        plt.close()
+    model_kwargs['dt'] = torch.Tensor([1/T] * n).to(device)
+    logger.info(f"Generating stochastic samples")
+    x = torch.randn(n, Ntgt, c, device=device)
+    # loop to denoise
+    for t in range(T):
+        with torch.no_grad():
+            pred = model(x, torch.Tensor([t / T] * x.shape[0]).to(device), **model_kwargs)
+        alpha = 1 + t / T * (1 - t / T)
+        sigma = 0.2 * (t / T * (1 - t / T)) ** 0.5
+        x += (alpha * pred + sigma * torch.randn_like(x).to(x.device)) / T
+        x = x.clamp_(-1., 1.)
 
-    all_samples = []
-    T = args.timesteps
-    for s in range(args.num_samples):
-        logger.info(f"Generating deterministic samples {s+1}")
-        x = torch.randn(args.global_batch_size, args.image_size**2, args.num_channels, device=device)   
-        for t in range(T):
-            with torch.no_grad():
-                pred = model(x, torch.Tensor([T-t]*x.shape[0]).to(device), **model_kwargs)
-            alpha = 1. # 1+t/T*(1-t/T)
-            sigma = 0. #0.2*(t/T*(1-t/T))**0.5
-            x += (alpha*pred + sigma*torch.randn_like(x).to(x.device))/T    
-            x = x.clamp_(-1., 1.)    
-        all_samples.append(x.cpu().numpy())
-        plt.figure(figsize=(10*n, 10))
-        for i in range(n):
-            plt.subplot(1, n, i + 1)
-            plt.imshow((all_samples[s][i].reshape(w, w, c)+1.)/2.)
-            plt.axis('off')
-        plt.tight_layout()
-        plt.savefig(f"{experiment_dir}/det_samples{s}.png")
-        plt.close()
+    x = x.detach()
 
-    torch.save({'samples': all_samples, 'noisy_samples': all_noisy_samples}, f"{experiment_dir}/samples.pt")
+    imgs = build_ctx_tgt_viz_images(
+        img_flat=img,  # (B, N, C) in [-1,1]
+        ctx_x=model_kwargs['ctx_pos'],
+        ctx_y=model_kwargs['ctx_x'],
+        tgt_x=model_kwargs['pos'],
+        pred_y=x,
+        img_size=args.image_size,
+        n_examples=8,  # number of columns
+    )
+    grid = vutils.make_grid(
+        imgs,
+        nrow=n,  # == n_examples → 3 rows
+        padding=2,
+        normalize=True,
+        value_range=(-1, 1)
+    )
 
-    plt.tight_layout()
-    plt.savefig(f"{experiment_dir}/all_samples.png")
-    plt.close()
+    save_path = f"{experiment_dir}/stochastic_samples.png"
+    save_image(grid, save_path)
     logger.info("Done!")
     
 

@@ -219,8 +219,8 @@ def validate(
 
     # batch
     model_kwargs, Ntgt = sample_ctx_tgt_test(img, img_size, ctx_type=ctx_type)
-
     x = torch.randn(B, Ntgt, C, device=device)
+    model_kwargs['dt'] = torch.Tensor([1/T] * x.shape[0]).to(device)
 
     # loop to denoise
     for t in range(T):
