@@ -10,6 +10,7 @@ A minimal training script for DiT using PyTorch DDP.
 from datetime import datetime
 
 import torch
+from tqdm import tqdm
 
 from train_np_dit import ddp_setup, print_gpu_info, set_seed, maybe_wrap_ddp
 from vis import sample_ctx_tgt_test, build_ctx_tgt_viz_images
@@ -136,7 +137,7 @@ def main(args):
     # ----- wandb -----
     run = None
     ts = datetime.now().strftime("M%m-D%d-H%H_M%M")
-    run_name = f"Sampling_{args.expname}_{ts}"
+    run_name = f"Sampling_{args.expname}T{args.timesteps}__{ts}"
 
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)
@@ -209,7 +210,7 @@ def main(args):
     print(f"Generating stochastic samples")
     x = torch.randn(n, Ntgt, c, device=device)
     # loop to denoise
-    for t in range(T):
+    for t in tqdm(range(T)):
         with torch.no_grad():
             pred = model(x, torch.Tensor([t / T] * x.shape[0]).to(device), **model_kwargs)
         alpha = 1 + t / T * (1 - t / T)
