@@ -201,7 +201,7 @@ def main(args):
     img = next(iter(loader))[0].to(device) # Get a batch of images
     local_batch_size = img.shape[0]
     img = img.to(device).reshape(local_batch_size, args.num_channels, args.image_size * args.image_size).transpose(1, 2)
-    model_kwargs, Ntgt = sample_ctx_tgt_test(img, w, "random5")
+    model_kwargs, Ntgt = sample_ctx_tgt_test(img, w, "random", rand_perc=args.ctx_rand_perc)
 
     all_noisy_samples = []
     T = args.timesteps
@@ -261,5 +261,6 @@ if __name__ == "__main__":
     parser.add_argument("--timesteps", type=int, default=1000)
     parser.add_argument("--num_samples", type=int, default=3)
     parser.add_argument("--ctx_type", type=str, choices=["none", "half", "quart", "frame", "random"], default="random")
+    parser.add_argument("--ctx-rand-perc", type=int, default=0.05)
     args = parser.parse_args()
     main(args)

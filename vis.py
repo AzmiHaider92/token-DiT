@@ -12,7 +12,7 @@ torch.backends.cudnn.allow_tf32 = True
 
 
 
-def sample_ctx_tgt_test(img: torch.Tensor, image_size: int, ctx_type: str):
+def sample_ctx_tgt_test(img: torch.Tensor, image_size: int, ctx_type: str, rand_perc: float):
     """
     Test-time split where context + target = all pixels, no overlap.
 
@@ -89,7 +89,7 @@ def sample_ctx_tgt_test(img: torch.Tensor, image_size: int, ctx_type: str):
 
     else:
         # random ~5% of pixels as context, per image
-        ctx_size = image_size ** 2 // 20
+        ctx_size = int( rand_perc * (image_size ** 2))
         # random permutation of indices per batch element
         rand = torch.rand(B, N, device=device)
         ctx_idxs = rand.argsort(dim=-1)[..., :ctx_size]                    # (B, ctx_size)
